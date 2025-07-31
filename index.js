@@ -23,6 +23,55 @@ let lastUpdatedQuotes = null;
 
 const Redis = require('ioredis');
 
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function retryRequest(fn, retries = 3, delayMs = 500) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (retries === 0) throw err;
+    await delay(delayMs);
+    return retryRequest(fn, retries - 1, delayMs * 2);
+  }
+}
+
+async function fetchNewsDetailSafe(url) {
+  return retryRequest(async () => {
+    const { data } = await axios.get(url, {
+      timeout: 300000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+
+    const $ = cheerio.load(data);
+    const articleDiv = $('div.article-content').clone();
+    articleDiv.find('span, h3').remove();
+    const plainText = articleDiv.text().trim();
+    return { text: plainText };
+  });
+}
+
+// 🔁 Fungsi bantu untuk batching request paralel
+async function runParallelWithLimit(tasks, limit = 3) {
+  const results = [];
+  const executing = new Set();
+
+  for (const task of tasks) {
+    const p = Promise.resolve().then(() => task());
+    results.push(p);
+    executing.add(p);
+
+    const clean = () => executing.delete(p);
+    p.then(clean).catch(clean);
+
+    if (executing.size >= limit) {
+      await Promise.race(executing);
+    }
+  }
+
+  return Promise.all(results);
+}
+
+
 // Gunakan variabel lingkungan untuk koneksi fleksibel
 const redis = new Redis(process.env.REDIS_PUBLIC_URL || {
   host: '127.0.0.1', // Redis lokal
@@ -68,7 +117,7 @@ async function getOrSetCache(key, fetchFn, ttlInSeconds = null) {
 async function fetchNewsDetail(url) {
   try {
     const { data } = await axios.get(url, {
-          timeout: 1440000,
+          timeout: 720000,
           headers: { 'User-Agent': 'Mozilla/5.0' },
         });
     const $ = cheerio.load(data);
@@ -85,7 +134,7 @@ async function fetchNewsDetail(url) {
 async function fetchNewsDetailID(url) {
   try {
     const { data } = await axios.get(url, {
-          timeout: 1440000,
+          timeout: 720000,
           headers: { 'User-Agent': 'Mozilla/5.0' },
         });
     const $ = cheerio.load(data);
@@ -106,52 +155,69 @@ async function fetchNewsDetailID(url) {
 // Scrape News
 // =========================
 async function scrapeNews() {
-  console.log('Scraping news...');
-  const pageLimit = 5;
-  const results = [];
+  console.log('🚀 Scraping news (parallel)...');
+  const pageLimit = 3;
+  const allTasks = [];
 
   try {
     for (const cat of newsCategories) {
       for (let i = 0; i < pageLimit; i++) {
         const offset = i * 10;
         const url = `https://www.newsmaker.id/index.php/en/${cat}?start=${offset}`;
-        const { data } = await axios.get(url, {
-          timeout: 720000,
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-        });
+        allTasks.push(async () => {
+          try {
+            const { data } = await axios.get(url, {
+              timeout: 300000,
+              headers: { 'User-Agent': 'Mozilla/5.0' },
+            });
 
-        const $ = cheerio.load(data);
-        const newsItems = [];
+            const $ = cheerio.load(data);
+            const items = [];
 
-        $('div.single-news-item').each((_, el) => {
-          const title = $(el).find('h5.card-title a').text().trim();
-          const link = 'https://www.newsmaker.id' + $(el).find('h5.card-title a').attr('href');
-          const image = 'https://www.newsmaker.id' + $(el).find('img.card-img').attr('src');
-          const category = $(el).find('span.category-label').text().trim();
+            $('div.single-news-item').each((_, el) => {
+              const title = $(el).find('h5.card-title a').text().trim();
+              const link = 'https://www.newsmaker.id' + $(el).find('h5.card-title a').attr('href');
+              const image = 'https://www.newsmaker.id' + $(el).find('img.card-img').attr('src');
+              const category = $(el).find('span.category-label').text().trim();
 
-          let date = '';
-          let summary = '';
+              let date = '';
+              let summary = '';
 
-          $(el).find('p.card-text').each((_, p) => {
-            const text = $(p).text().trim();
-            if (/\d{1,2} \w+ \d{4}/.test(text)) date = text;
-            else summary = text;
-          });
+              $(el).find('p.card-text').each((_, p) => {
+                const text = $(p).text().trim();
+                if (/\d{1,2} \w+ \d{4}/.test(text)) date = text;
+                else summary = text;
+              });
 
-          if (title && link && summary) {
-            newsItems.push({ title, link, image, category, date, summary });
+              if (title && link && summary) {
+                items.push({ title, link, image, category, date, summary });
+              }
+            });
+
+            const detailTasks = items.map(item => async () => {
+              try {
+                const detail = await fetchNewsDetailSafe(item.link);
+                return { ...item, detail };
+              } catch {
+                return { ...item, detail: { text: null } };
+              }
+            });
+
+            const detailedItems = await runParallelWithLimit(detailTasks, 3);
+            return detailedItems;
+          } catch (err) {
+            console.warn(`⚠️ Failed to scrape page: ${url} | ${err.message}`);
+            return [];
           }
         });
-
-        for (const item of newsItems) {
-          const detail = await fetchNewsDetail(item.link);
-          results.push({ ...item, detail });
-        }
       }
     }
 
+    const pageResults = await runParallelWithLimit(allTasks, 2);
+    const flatResults = pageResults.flat();
+
     const seen = new Set();
-    const uniqueNews = results.filter(news => {
+    const uniqueNews = flatResults.filter(news => {
       if (seen.has(news.link)) return false;
       seen.add(news.link);
       return true;
@@ -159,73 +225,80 @@ async function scrapeNews() {
 
     cachedNews = uniqueNews;
     lastUpdatedNews = new Date();
-    try {
-      const keys = await redis.keys('news:*');
-      if (keys.length > 0) {
-        await redis.del(...keys);
-        console.log(`♻️ Cleared ${keys.length} news:* cache key(s) after scraping.`);
-      }
-    } catch (err) {
-      console.error('❌ Failed to clear news:* cache:', err.message);
-    }
+    const keys = await redis.keys('news:*');
+    if (keys.length > 0) await redis.del(...keys);
 
     console.log(`✅ News updated (${cachedNews.length} items)`);
   } catch (err) {
-    console.error('❌ News scraping failed:', err.message);
+    console.error('❌ scrapeNews failed:', err.message);
   }
 }
 
+
 async function scrapeNewsID() {
-  console.log('Scraping ID news...');
-  const pageLimit = 5;
-  const results = [];
+  console.log('🚀 Scraping news ID (parallel)...');
+  const pageLimit = 3;
+  const allTasks = [];
 
   try {
     for (const cat of newsCategories) {
       for (let i = 0; i < pageLimit; i++) {
         const offset = i * 10;
         const url = `https://www.newsmaker.id/index.php/id/${cat}?start=${offset}`;
-        const { data } = await axios.get(url, {
-          timeout: 720000,
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-        });
-
-        const $ = cheerio.load(data);
-        const newsItems = [];
-
-        $('div.single-news-item').each((_, el) => {
-          const title = $(el).find('h5.card-title a').text().trim();
-          const link = 'https://www.newsmaker.id' + $(el).find('h5.card-title a').attr('href');
-          const image = 'https://www.newsmaker.id' + $(el).find('img.card-img').attr('src');
-          const category = $(el).find('span.category-label').text().trim();
-
-          let date = '';
-          let summary = '';
-
-          $(el).find('p.card-text').each((_, p) => {
-            const text = $(p).text().trim();
-            if (/\d{1,2} \w+ \d{4}/.test(text)) date = text;
-            else summary = text;
-          });
-
-          if (title && link && summary) {
-            newsItems.push({ title, link, image, category, date, summary });
-          }
-        });
-
-        for (const item of newsItems) {
+        allTasks.push(async () => {
           try {
-            const detail = await fetchNewsDetailID(item.link); // Sesuaikan dengan fungsi detail ID
-            results.push({ ...item, detail });
-          } catch (e) {
-            console.error(`⚠️ Failed to fetch detail from ${item.link}:`, e.message);
+            const { data } = await axios.get(url, {
+              timeout: 300000,
+              headers: { 'User-Agent': 'Mozilla/5.0' },
+            });
+
+            const $ = cheerio.load(data);
+            const items = [];
+
+            $('div.single-news-item').each((_, el) => {
+              const title = $(el).find('h5.card-title a').text().trim();
+              const link = 'https://www.newsmaker.id' + $(el).find('h5.card-title a').attr('href');
+              const image = 'https://www.newsmaker.id' + $(el).find('img.card-img').attr('src');
+              const category = $(el).find('span.category-label').text().trim();
+
+              let date = '';
+              let summary = '';
+
+              $(el).find('p.card-text').each((_, p) => {
+                const text = $(p).text().trim();
+                if (/\d{1,2} \w+ \d{4}/.test(text)) date = text;
+                else summary = text;
+              });
+
+              if (title && link && summary) {
+                items.push({ title, link, image, category, date, summary });
+              }
+            });
+
+            const detailTasks = items.map(item => async () => {
+              try {
+                const detail = await fetchNewsDetailSafe(item.link);
+                return { ...item, detail };
+              } catch {
+                return { ...item, detail: { text: null } };
+              }
+            });
+
+            const detailedItems = await runParallelWithLimit(detailTasks, 3);
+            return detailedItems;
+          } catch (err) {
+            console.warn(`⚠️ Failed to scrape page: ${url} | ${err.message}`);
+            return [];
           }
-        }
+        });
       }
     }
 
+    const pageResults = await runParallelWithLimit(allTasks, 2);
+    const flatResults = pageResults.flat();
+
     const seen = new Set();
-    const uniqueNews = results.filter(news => {
+    const uniqueNews = flatResults.filter(news => {
       if (seen.has(news.link)) return false;
       seen.add(news.link);
       return true;
@@ -233,22 +306,15 @@ async function scrapeNewsID() {
 
     cachedNewsID = uniqueNews;
     lastUpdatedNewsID = new Date();
-
-    try {
-      const keys = await redis.keys('newsID:*');
-      if (keys.length > 0) {
-        await redis.del(...keys);
-        console.log(`♻️ Cleared ${keys.length} newsID:* cache key(s) after scraping.`);
-      }
-    } catch (err) {
-      console.error('❌ Failed to clear newsID:* cache:', err.message);
-    }
+    const keys = await redis.keys('newsID:*');
+    if (keys.length > 0) await redis.del(...keys);
 
     console.log(`✅ News ID updated (${cachedNewsID.length} items)`);
   } catch (err) {
-    console.error('❌ News ID scraping failed:', err.message);
+    console.error('❌ scrapeNewsID failed:', err.message);
   }
 }
+
 
 
 // =========================
@@ -838,9 +904,24 @@ app.delete('/api/cache', async (req, res) => {
   }
 });
 
+app.get('/api/status', (req, res) => {
+  res.json({
+    newsCount: cachedNews.length,
+    newsIDCount: cachedNewsID.length,
+    calendarCount: cachedCalendar.length,
+    quotesCount: cachedQuotes.length,
+    lastUpdated: {
+      news: lastUpdatedNews,
+      newsID: lastUpdatedNewsID,
+      calendar: lastUpdatedCalendar,
+      quotes: lastUpdatedQuotes
+    }
+  });
+});
+
+
 
 app.listen(PORT, () => {
   console.log(`🚀 Server ready at http://localhost:${PORT}`);
 });
-
 
