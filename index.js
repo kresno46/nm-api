@@ -1,11 +1,14 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const puppeteer = require('puppeteer');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const { sequelize, News, HistoricalData } = require('./models');
+
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 
 
@@ -24,6 +27,30 @@ let lastUpdatedQuotes = null;
 const Redis = require('ioredis');
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+sequelize.sync().then(() => {
+  console.log('📦 Database News & NewsID synced');
+  console.log('📦 Database synced (include HistoricalData)');
+});
+
+(async () => {
+  try {
+    await sequelize.authenticate();
+    console.log('✅ MySQL connected successfully!');
+  } catch (err) {
+    console.error('❌ MySQL connection error:', err.message);
+  }
+
+  try {
+    await redis.set('test_key', 'hello_redis');
+    const val = await redis.get('test_key');
+    console.log('🔁 Redis check: ', val);
+  } catch (err) {
+    console.error('❌ Redis connection error:', err.message);
+  }
+})();
+
+
 
 async function retryRequest(fn, retries = 3, delayMs = 500) {
   try {
@@ -196,14 +223,22 @@ async function scrapeNews() {
 
             const detailTasks = items.map(item => async () => {
               try {
+                const exists = await News.findOne({ where: { link: item.link } });
+                if (exists) {
+                  console.log(`⏭️ Skipped (already in DB): ${item.title}`);
+                  return null;
+                }
+
                 const detail = await fetchNewsDetailSafe(item.link);
                 return { ...item, detail };
-              } catch {
-                return { ...item, detail: { text: null } };
+              } catch (err) {
+                console.warn(`⚠️ Failed to fetch detail for ${item.link}: ${err.message}`);
+                return null;
               }
             });
 
-            const detailedItems = await runParallelWithLimit(detailTasks, 3);
+            const detailedItems = (await runParallelWithLimit(detailTasks, 3)).filter(Boolean);
+            console.log(`🔎 ${cat} → ${detailedItems.length} new item(s) scraped`);
             return detailedItems;
           } catch (err) {
             console.warn(`⚠️ Failed to scrape page: ${url} | ${err.message}`);
@@ -216,14 +251,26 @@ async function scrapeNews() {
     const pageResults = await runParallelWithLimit(allTasks, 2);
     const flatResults = pageResults.flat();
 
-    const seen = new Set();
-    const uniqueNews = flatResults.filter(news => {
-      if (seen.has(news.link)) return false;
-      seen.add(news.link);
-      return true;
-    });
+    cachedNews = flatResults;
 
-    cachedNews = uniqueNews;
+    for (const item of flatResults) {
+      try {
+        await News.create({
+          title: item.title,
+          link: item.link,
+          image: item.image,
+          category: item.category,
+          date: item.date,
+          summary: item.summary,
+          detail: item.detail?.text || '',
+          language: 'en'
+        });
+        console.log(`✅ Saved to DB: ${item.title}`);
+      } catch (err) {
+        console.error(`❌ Failed to save: ${item.title} - ${err.message}`);
+      }
+    }
+
     lastUpdatedNews = new Date();
     const keys = await redis.keys('news:*');
     if (keys.length > 0) await redis.del(...keys);
@@ -277,14 +324,22 @@ async function scrapeNewsID() {
 
             const detailTasks = items.map(item => async () => {
               try {
+                const exists = await News.findOne({ where: { link: item.link } });
+                if (exists) {
+                  console.log(`⏭️ Skipped (already in DB): ${item.title}`);
+                  return null;
+                }
+
                 const detail = await fetchNewsDetailSafe(item.link);
                 return { ...item, detail };
-              } catch {
-                return { ...item, detail: { text: null } };
+              } catch (err) {
+                console.warn(`⚠️ Failed to fetch detail for ${item.link}: ${err.message}`);
+                return null;
               }
             });
 
-            const detailedItems = await runParallelWithLimit(detailTasks, 3);
+            const detailedItems = (await runParallelWithLimit(detailTasks, 3)).filter(Boolean);
+            console.log(`🔎 ${cat} [ID] → ${detailedItems.length} new item(s) scraped`);
             return detailedItems;
           } catch (err) {
             console.warn(`⚠️ Failed to scrape page: ${url} | ${err.message}`);
@@ -297,14 +352,26 @@ async function scrapeNewsID() {
     const pageResults = await runParallelWithLimit(allTasks, 2);
     const flatResults = pageResults.flat();
 
-    const seen = new Set();
-    const uniqueNews = flatResults.filter(news => {
-      if (seen.has(news.link)) return false;
-      seen.add(news.link);
-      return true;
-    });
+    cachedNewsID = flatResults;
 
-    cachedNewsID = uniqueNews;
+    for (const item of flatResults) {
+      try {
+        await News.create({
+          title: item.title,
+          link: item.link,
+          image: item.image,
+          category: item.category,
+          date: item.date,
+          summary: item.summary,
+          detail: item.detail?.text || '',
+          language: 'id'
+        });
+        console.log(`✅ [ID] Saved to DB: ${item.title}`);
+      } catch (err) {
+        console.error(`❌ [ID] Failed to save: ${item.title} - ${err.message}`);
+      }
+    }
+
     lastUpdatedNewsID = new Date();
     const keys = await redis.keys('newsID:*');
     if (keys.length > 0) await redis.del(...keys);
@@ -314,7 +381,6 @@ async function scrapeNewsID() {
     console.error('❌ scrapeNewsID failed:', err.message);
   }
 }
-
 
 
 // =========================
@@ -385,26 +451,26 @@ async function scrapeCalendar() {
     });
 
     cachedCalendar = eventsData;
-lastUpdatedCalendar = new Date();
-await browser.close();
-console.log(`✅ Calendar updated (${cachedCalendar.length} valid events)`);
+    lastUpdatedCalendar = new Date();
+    await browser.close();
+    console.log(`✅ Calendar updated (${cachedCalendar.length} valid events)`);
 
-try {
-  await redis.set('calendar:all', JSON.stringify({
-    status: 'success',
-    updatedAt: lastUpdatedCalendar,
-    total: cachedCalendar.length,
-    data: cachedCalendar
-  }), 'EX', 60 * 15);
+    try {
+      await redis.set('calendar:all', JSON.stringify({
+        status: 'success',
+        updatedAt: lastUpdatedCalendar,
+        total: cachedCalendar.length,
+        data: cachedCalendar
+      }), 'EX', 60 * 15);
 
-  console.log('🧠 Calendar data saved to Redis with TTL 15 minutes');
-} catch (err) {
-  console.error('❌ Failed to save calendar to Redis:', err.message);
-}
-} catch (err) {
-    if (browser) await browser.close();
-    console.error('❌ Calendar scraping failed:', err.message);
-  }
+      console.log('🧠 Calendar data saved to Redis with TTL 15 minutes');
+    } catch (err) {
+      console.error('❌ Failed to save calendar to Redis:', err.message);
+    }
+    } catch (err) {
+        if (browser) await browser.close();
+        console.error('❌ Calendar scraping failed:', err.message);
+    }
 
 }
 
@@ -709,17 +775,54 @@ async function scrapeAllHistoricalData() {
         const data = await scrapeAllDataForSymbol(cid);
         console.log(`✅ ${name}: ${data.length} rows`);
 
-        // Store data in Redis cache per symbol
+        // 💾 Simpan ke DB
+        for (const row of data) {
+          try {
+            const [record, created] = await HistoricalData.findOrCreate({
+              where: {
+                symbol: name,
+                date: row.date
+              },
+              defaults: {
+                event: row.event || null,
+                open: row.open,
+                high: row.high,
+                low: row.low,
+                close: row.close,
+                change: row.change,
+                volume: row.volume,
+                openInterest: row.openInterest
+              }
+            });
+
+            if (created) {
+              console.log(`✅ Saved: ${name} (${row.date})`);
+            } else {
+              console.log(`⏭️ Skipped (exists): ${name} (${row.date})`);
+            }
+
+          } catch (err) {
+            console.error(`❌ Failed to save row for ${name} (${row.date}): ${err.message}`);
+          }
+        }
+
+        // Optional: Cache juga ke Redis
         const cacheKey = `historical:${name.toLowerCase()}:all`;
         try {
-          await redis.set(cacheKey, JSON.stringify({ status: 'success', symbol: name, data, updatedAt: new Date() }), 'EX', 60 * 60 * 2);
-          console.log(`💾 Cached historical data for ${name} with key ${cacheKey}`);
+          await redis.set(
+            cacheKey,
+            JSON.stringify({ status: 'success', symbol: name, data, updatedAt: new Date() }),
+            'EX',
+            60 * 60 * 2
+          );
+          console.log(`💾 Cached historical data for ${name} in Redis`);
         } catch (err) {
-          console.error(`❌ Failed to cache historical data for ${name}:`, err.message);
+          console.error(`❌ Redis cache error for ${name}:`, err.message);
         }
       })
     )
   );
+
 
   console.log('🎉 All scraping completed.');
   return true;
@@ -750,30 +853,34 @@ setInterval(scrapeQuotes, 0.15 * 60 * 1000);
 // =========================
 app.get('/api/news', async (req, res) => {
   const { category = 'all', search = '' } = req.query;
-  const cacheKey = `news:${category.toLowerCase()}:${search.toLowerCase()}`;
-  try {
-    const data = await getOrSetCache(cacheKey, async () => {
-      let filtered = cachedNews;
-      if (category !== 'all') {
-        filtered = filtered.filter(news => news.category.toLowerCase().includes(category.toLowerCase()));
-      }
-      if (search) {
-        const keyword = search.toLowerCase();
-        filtered = filtered.filter(news =>
-          news.title.toLowerCase().includes(keyword) ||
-          news.summary.toLowerCase().includes(keyword) ||
-          news.detail?.text?.toLowerCase().includes(keyword)
-        );
-      }
-      return { status: 'EN success', updatedAt: lastUpdatedNews, total: filtered.length, data: filtered };
-    }, 1700); // TTL 5 menit
+  const { Op } = require('sequelize');
 
-    res.json(data);
+  try {
+    const where = { language: 'en' };
+    if (category !== 'all') where.category = { [Op.like]: `%${category}%` };
+    if (search) {
+      where[Op.or] = [
+        { title: { [Op.like]: `%${search}%` } },
+        { summary: { [Op.like]: `%${search}%` } },
+        { detail: { [Op.like]: `%${search}%` } },
+      ];
+    }
+
+    const results = await News.findAll({
+      where,
+      order: [['createdAt', 'DESC']],
+    });
+
+    res.json({
+      status: 'success',
+      total: results.length,
+      data: results,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message });
   }
 });
+
 
 app.get('/api/news-id', async (req, res) => {
   const { category = 'all', search = '' } = req.query;
