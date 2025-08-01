@@ -156,7 +156,7 @@ async function fetchNewsDetailID(url) {
 // =========================
 async function scrapeNews() {
   console.log('🚀 Scraping news (parallel)...');
-  const pageLimit = 3;
+  const pageLimit = 5;
   const allTasks = [];
 
   try {
@@ -237,7 +237,7 @@ async function scrapeNews() {
 
 async function scrapeNewsID() {
   console.log('🚀 Scraping news ID (parallel)...');
-  const pageLimit = 3;
+  const pageLimit = 5;
   const allTasks = [];
 
   try {
