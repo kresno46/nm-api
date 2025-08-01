@@ -1,7 +1,7 @@
 module.exports = (sequelize, DataTypes) => {
   const News = sequelize.define('News', {
     title: { type: DataTypes.TEXT, allowNull: false },
-    link: { type: DataTypes.TEXT, allowNull: false, unique: true },
+    link: { type: DataTypes.STRING(512), allowNull: false, unique: true },
     image: { type: DataTypes.TEXT },
     category: { type: DataTypes.STRING },
     date: { type: DataTypes.STRING },
