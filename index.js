@@ -905,12 +905,12 @@ app.get('/api/news-id', async (req, res) => {
         );
       }
 
-      return {
-        status: 'ID success',
-        updatedAt: lastUpdatedNewsID,
-        total: filtered.length,
-        data: filtered
-      };
+      // return {
+      //   status: 'ID success',
+      //   updatedAt: lastUpdatedNewsID,
+      //   total: filtered.length,
+      //   data: filtered
+      // };
     }, 1700); // TTL 5 menit
 
     res.json(data);
