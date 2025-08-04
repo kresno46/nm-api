@@ -884,39 +884,31 @@ app.get('/api/news', async (req, res) => {
 
 app.get('/api/news-id', async (req, res) => {
   const { category = 'all', search = '' } = req.query;
-  const cacheKey = `newsID:${category.toLowerCase()}:${search.toLowerCase()}`;
+  const { Op } = require('sequelize');
 
   try {
-    const data = await getOrSetCache(cacheKey, async () => {
-      let filtered = cachedNewsID;
+    const where = { language: 'id' };
+    if (category !== 'all') where.category = { [Op.like]: `%${category}%` };
+    if (search) {
+      where[Op.or] = [
+        { title: { [Op.like]: `%${search}%` } },
+        { summary: { [Op.like]: `%${search}%` } },
+        { detail: { [Op.like]: `%${search}%` } },
+      ];
+    }
 
-      if (category !== 'all') {
-        filtered = filtered.filter(news =>
-          news.category.toLowerCase().includes(category.toLowerCase())
-        );
-      }
+    const results = await News.findAll({
+      where,
+      order: [['createdAt', 'DESC']],
+    });
 
-      if (search) {
-        const keyword = search.toLowerCase();
-        filtered = filtered.filter(news =>
-          news.title.toLowerCase().includes(keyword) ||
-          news.summary.toLowerCase().includes(keyword) ||
-          news.detail?.text?.toLowerCase().includes(keyword)
-        );
-      }
-
-      // return {
-      //   status: 'ID success',
-      //   updatedAt: lastUpdatedNewsID,
-      //   total: filtered.length,
-      //   data: filtered
-      // };
-    }, 1700); // TTL 5 menit
-
-    res.json(data);
+    res.json({
+      status: 'success',
+      total: results.length,
+      data: results,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message });
   }
 });
 
