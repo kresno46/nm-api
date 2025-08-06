@@ -183,13 +183,13 @@ async function fetchNewsDetailID(url) {
 // =========================
 async function scrapeNews() {
   console.log('🚀 Scraping news (parallel)...');
-  const pageLimit = 5;
+  const pageLimit = 10;
   const allTasks = [];
 
   try {
     for (const cat of newsCategories) {
       for (let i = 0; i < pageLimit; i++) {
-        const offset = i * 10;
+        const offset = i * 20;
         const url = `https://www.newsmaker.id/index.php/en/${cat}?start=${offset}`;
         allTasks.push(async () => {
           try {
@@ -284,13 +284,13 @@ async function scrapeNews() {
 
 async function scrapeNewsID() {
   console.log('🚀 Scraping news ID (parallel)...');
-  const pageLimit = 5;
+  const pageLimit = 10;
   const allTasks = [];
 
   try {
     for (const cat of newsCategories) {
       for (let i = 0; i < pageLimit; i++) {
-        const offset = i * 10;
+        const offset = i * 20;
         const url = `https://www.newsmaker.id/index.php/id/${cat}?start=${offset}`;
         allTasks.push(async () => {
           try {
@@ -685,7 +685,7 @@ async function scrapePageForSymbol(cid, start, retries = 3, backoff = 1000) {
 
 
 // === IMPROVED SCRAPE ALL DATA FOR A SYMBOL ===
-async function scrapeAllDataForSymbol(cid, maxRows = 4000) {
+async function scrapeAllDataForSymbol(cid, maxRows = 5000) {
   console.log(`🎯 Starting complete scrape for cid=${cid} (max ${maxRows} rows)`);
   const allData = [];
   let start = 0;
