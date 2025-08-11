@@ -65,7 +65,7 @@ async function retryRequest(fn, retries = 3, delayMs = 500) {
 async function fetchNewsDetailSafe(url) {
   return retryRequest(async () => {
     const { data } = await axios.get(url, {
-      timeout: 300000,
+      timeout: 600000,
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
 
@@ -111,11 +111,12 @@ redis.on('error', (err) => console.error('❌ Redis error:', err));
 
 
 const newsCategories = [
-  'economic-news/all-economic-news',
+  'economic-news/economy',
   'economic-news/fiscal-moneter',
-  'market-news/index/all-index',
-  'market-news/commodity/all-commodity',
-  'market-news/currencies/all-currencies',
+  'market-news/index',
+  'market-news/commodity',
+  'market-news/currencies',
+  'market-news/crypto',
   'analysis/analysis-market',
   'analysis/analysis-opinion',
 ];
@@ -182,19 +183,19 @@ async function fetchNewsDetailID(url) {
 // Scrape News
 // =========================
 async function scrapeNews() {
-  console.log('🚀 Scraping news (parallel)...');
+console.log('🚀 Scraping news EN (parallel)...');
   const pageLimit = 10;
   const allTasks = [];
 
   try {
     for (const cat of newsCategories) {
       for (let i = 0; i < pageLimit; i++) {
-        const offset = i * 20;
+        const offset = i * 10;
         const url = `https://www.newsmaker.id/index.php/en/${cat}?start=${offset}`;
         allTasks.push(async () => {
           try {
             const { data } = await axios.get(url, {
-              timeout: 300000,
+              timeout: 600000,
               headers: { 'User-Agent': 'Mozilla/5.0' },
             });
 
@@ -223,7 +224,7 @@ async function scrapeNews() {
 
             const detailTasks = items.map(item => async () => {
               try {
-                const exists = await News.findOne({ where: { link: item.link } });
+                const exists = await News.findOne({ where: { link: item.title } });
                 if (exists) {
                   console.log(`⏭️ Skipped (already in DB): ${item.title}`);
                   return null;
@@ -238,7 +239,7 @@ async function scrapeNews() {
             });
 
             const detailedItems = (await runParallelWithLimit(detailTasks, 3)).filter(Boolean);
-            console.log(`🔎 ${cat} → ${detailedItems.length} new item(s) scraped`);
+            console.log(`🔎 ${cat} [EN] → ${detailedItems.length} new item(s) scraped`);
             return detailedItems;
           } catch (err) {
             console.warn(`⚠️ Failed to scrape page: ${url} | ${err.message}`);
@@ -265,17 +266,17 @@ async function scrapeNews() {
           detail: item.detail?.text || '',
           language: 'en'
         });
-        console.log(`✅ Saved to DB: ${item.title}`);
+        console.log(`✅ [EN] Saved to DB: ${item.title}`);
       } catch (err) {
-        console.error(`❌ Failed to save: ${item.title} - ${err.message}`);
+        console.error(`❌ [EN] Failed to save: ${item.title} - ${err.message}`);
       }
     }
 
-    lastUpdatedNews = new Date();
+    lastUpdatedNews= new Date();
     const keys = await redis.keys('news:*');
     if (keys.length > 0) await redis.del(...keys);
 
-    console.log(`✅ News updated (${cachedNews.length} items)`);
+    console.log(`✅ News EN updated (${cachedNews.length} items)`);
   } catch (err) {
     console.error('❌ scrapeNews failed:', err.message);
   }
@@ -290,12 +291,12 @@ async function scrapeNewsID() {
   try {
     for (const cat of newsCategories) {
       for (let i = 0; i < pageLimit; i++) {
-        const offset = i * 20;
+        const offset = i * 10;
         const url = `https://www.newsmaker.id/index.php/id/${cat}?start=${offset}`;
         allTasks.push(async () => {
           try {
             const { data } = await axios.get(url, {
-              timeout: 300000,
+              timeout: 600000,
               headers: { 'User-Agent': 'Mozilla/5.0' },
             });
 
@@ -324,7 +325,7 @@ async function scrapeNewsID() {
 
             const detailTasks = items.map(item => async () => {
               try {
-                const exists = await News.findOne({ where: { link: item.link } });
+                const exists = await News.findOne({ where: { link: item.title } });
                 if (exists) {
                   console.log(`⏭️ Skipped (already in DB): ${item.title}`);
                   return null;
@@ -479,19 +480,26 @@ async function scrapeCalendar() {
 // Scrape Live Quotes
 // =========================
 
+// Function to process the live quotes
 async function scrapeQuotes() {
   console.log('Scraping quotes from JSON endpoint...');
-  const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIN5+LCOPU5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
+  const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIQ5+LCOPV5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
   try {
     const { data } = await axios.get(url);
     const quotes = [];
     for (let i = 1; i <= data[0].count; i++) {
+      // Use `last` as a fallback for high, low, and open if they are 0 or missing
+      let high = data[i].high !== 0 ? data[i].high : data[i].last;
+      let low = data[i].low !== 0 ? data[i].low : data[i].last;
+      let open = data[i].open !== 0 ? data[i].open : data[i].last;
+
+      // Push the valid data into the quotes array
       quotes.push({
         symbol: data[i].symbol,
         last: data[i].last,
-        high: data[i].high,
-        low: data[i].low,
-        open: data[i].open,
+        high: high,
+        low: low,
+        open: open,
         prevClose: data[i].prevClose,
         valueChange: data[i].valueChange,
         percentChange: data[i].percentChange
@@ -504,6 +512,7 @@ async function scrapeQuotes() {
     console.error('❌ Quotes scraping failed:', err.message);
   }
 }
+
 
 
 // =========================
@@ -977,8 +986,31 @@ app.get('/api/historical', async (req, res) => {
 });
 
 app.get('/api/quotes', (req, res) => {
-  res.json({ status: 'success', updatedAt: lastUpdatedQuotes, total: cachedQuotes.length, data: cachedQuotes });
+  // Cek jika cachedQuotes kosong atau belum ada update
+  if (cachedQuotes.length === 0) {
+    return res.status(404).json({ status: 'error', message: 'No quotes data available' });
+  }
+
+  // Validasi data sebelum mengirim ke client
+  const validQuotes = cachedQuotes.map((quote) => {
+    // Cek dan fallback jika data high, low, atau open masih 0
+    return {
+      ...quote,
+      high: quote.high !== 0 ? quote.high : quote.last,  // fallback ke 'last' jika 'high' 0
+      low: quote.low !== 0 ? quote.low : quote.last,    // fallback ke 'last' jika 'low' 0
+      open: quote.open !== 0 ? quote.open : quote.last    // fallback ke 'last' jika 'open' 0
+    };
+  });
+
+  // Kirim data yang sudah tervalidasi
+  res.json({
+    status: 'success',
+    updatedAt: lastUpdatedQuotes,
+    total: validQuotes.length,
+    data: validQuotes,
+  });
 });
+
 
 app.delete('/api/cache', async (req, res) => {
   try {
@@ -1023,4 +1055,3 @@ app.get('/api/status', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server ready at http://localhost:${PORT}`);
 });
-
