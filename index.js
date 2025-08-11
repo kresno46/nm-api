@@ -224,7 +224,7 @@ async function scrapeNews() {
 
             const detailTasks = items.map(item => async () => {
               try {
-                const exists = await News.findOne({ where: { link: item.title } });
+                const exists = await News.findOne({ where: { link: item.link } });
                 if (exists) {
                   console.log(`⏭️ Skipped (already in DB): ${item.title}`);
                   return null;
@@ -325,7 +325,7 @@ async function scrapeNewsID() {
 
             const detailTasks = items.map(item => async () => {
               try {
-                const exists = await News.findOne({ where: { link: item.title } });
+                const exists = await News.findOne({ where: { link: item.link } });
                 if (exists) {
                   console.log(`⏭️ Skipped (already in DB): ${item.title}`);
                   return null;
