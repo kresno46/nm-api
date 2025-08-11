@@ -65,7 +65,7 @@ async function retryRequest(fn, retries = 3, delayMs = 500) {
 async function fetchNewsDetailSafe(url) {
   return retryRequest(async () => {
     const { data } = await axios.get(url, {
-      timeout: 300000,
+      timeout: 600000,
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
 
@@ -184,7 +184,7 @@ async function fetchNewsDetailID(url) {
 // =========================
 async function scrapeNews() {
 console.log('🚀 Scraping news EN (parallel)...');
-  const pageLimit = 5;
+  const pageLimit = 10;
   const allTasks = [];
 
   try {
@@ -285,7 +285,7 @@ console.log('🚀 Scraping news EN (parallel)...');
 
 async function scrapeNewsID() {
   console.log('🚀 Scraping news ID (parallel)...');
-  const pageLimit = 5;
+  const pageLimit = 10;
   const allTasks = [];
 
   try {
@@ -851,8 +851,8 @@ scrapeQuotes();
 scrapeAllHistoricalData();
 
 setInterval(scrapeAllHistoricalData, 60 * 60 * 1000); // Run every hour
-setInterval(scrapeNews, 5 * 60 * 1000);
-setInterval(scrapeNewsID, 10 * 60 * 1000);
+setInterval(scrapeNews, 30 * 60 * 1000);
+setInterval(scrapeNewsID, 30 * 60 * 1000);
 setInterval(scrapeCalendar, 60 * 60 * 1000);
 setInterval(scrapeQuotes, 0.15 * 60 * 1000);
 
