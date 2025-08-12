@@ -65,7 +65,7 @@ async function retryRequest(fn, retries = 3, delayMs = 500) {
 async function fetchNewsDetailSafe(url) {
   return retryRequest(async () => {
     const { data } = await axios.get(url, {
-      timeout: 600000,
+      timeout: 1200000,
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
 
@@ -195,7 +195,7 @@ async function scrapeNews() {
         allTasks.push(async () => {
           try {
             const { data } = await axios.get(url, {
-              timeout: 600000,
+              timeout: 1200000,
               headers: { 'User-Agent': 'Mozilla/5.0' },
             });
 
@@ -296,7 +296,7 @@ async function scrapeNewsID() {
         allTasks.push(async () => {
           try {
             const { data } = await axios.get(url, {
-              timeout: 600000,
+              timeout: 1200000,
               headers: { 'User-Agent': 'Mozilla/5.0' },
             });
 
