@@ -850,9 +850,9 @@ scrapeCalendar();
 scrapeQuotes();
 scrapeAllHistoricalData();
 
-setInterval(scrapeAllHistoricalData, 60 * 60 * 1000); // Run every hour
-setInterval(scrapeNews, 30 * 60 * 1000);
-setInterval(scrapeNewsID, 30 * 60 * 1000);
+setInterval(scrapeAllHistoricalData, 240 * 60 * 1000); // Run every hour
+setInterval(scrapeNews, 10 * 60 * 1000);
+setInterval(scrapeNewsID, 10 * 60 * 1000);
 setInterval(scrapeCalendar, 60 * 60 * 1000);
 setInterval(scrapeQuotes, 0.15 * 60 * 1000);
 
