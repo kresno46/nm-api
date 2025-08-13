@@ -5,15 +5,14 @@ const puppeteer = require('puppeteer');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { sequelize, News, HistoricalData } = require('./models');
-
+const Redis = require('ioredis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-
-
 app.use(cors());
 
+// ===== In-memory caches =====
 let cachedNews = [];
 let cachedNewsID = [];
 let cachedCalendar = [];
@@ -23,11 +22,16 @@ let lastUpdatedNewsID = null;
 let lastUpdatedCalendar = null;
 let lastUpdatedQuotes = null;
 
+// ===== Redis (init lebih awal, sebelum dipakai) =====
+const redis = new Redis(process.env.REDIS_PUBLIC_URL || {
+  host: '127.0.0.1',
+  port: 6379,
+  retryStrategy: (times) => Math.min(times * 50, 2000),
+});
+redis.on('connect', () => console.log('✅ Redis connected'));
+redis.on('error', (err) => console.error('❌ Redis error:', err));
 
-const Redis = require('ioredis');
-
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
+// ===== DB init =====
 sequelize.sync().then(() => {
   console.log('📦 Database News & NewsID synced');
   console.log('📦 Database synced (include HistoricalData)');
@@ -44,13 +48,14 @@ sequelize.sync().then(() => {
   try {
     await redis.set('test_key', 'hello_redis');
     const val = await redis.get('test_key');
-    console.log('🔁 Redis check: ', val);
+    console.log('🔁 Redis check:', val);
   } catch (err) {
     console.error('❌ Redis connection error:', err.message);
   }
 })();
 
-
+// ===== Helpers =====
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function retryRequest(fn, retries = 3, delayMs = 500) {
   try {
@@ -62,54 +67,88 @@ async function retryRequest(fn, retries = 3, delayMs = 500) {
   }
 }
 
-async function fetchNewsDetailSafe(url) {
-  return retryRequest(async () => {
-    const { data } = await axios.get(url, {
-      timeout: 1200000,
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
+// Header ala browser supaya lolos WAF/CDN
+const HTML_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Connection': 'keep-alive',
+  'Upgrade-Insecure-Requests': '1',
+  'DNT': '1',
+};
 
-    const $ = cheerio.load(data);
-    const articleDiv = $('div.article-content').clone();
-    articleDiv.find('span, h3').remove();
-    const plainText = articleDiv.text().trim();
-    return { text: plainText };
-  });
+function isWafOrChallenge($) {
+  const t = $.text().toLowerCase();
+  const ttl = $('title').text().toLowerCase();
+  return (
+    t.includes('access denied') ||
+    t.includes('forbidden') ||
+    t.includes('request blocked') ||
+    t.includes('captcha') ||
+    ttl.includes('forbidden') ||
+    ttl.includes('blocked')
+  );
 }
 
-// 🔁 Fungsi bantu untuk batching request paralel
+function normalizeSpace(s) {
+  return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+function extractNewsItem($, el) {
+  const $el = $(el);
+  const title = normalizeSpace($el.find('h5.card-title a').text());
+  const href = $el.find('h5.card-title a').attr('href');
+  const link = href ? 'https://www.newsmaker.id' + href : null;
+  const imgSrc = $el.find('img.card-img').attr('src');
+  const image = imgSrc ? 'https://www.newsmaker.id' + imgSrc : null;
+  const category = normalizeSpace($el.find('span.category-label').text());
+
+  let date = '';
+  let summary = '';
+  $el.find('p.card-text').each((_, p) => {
+    const text = normalizeSpace($(p).text());
+    if (/\b\d{1,2}\s+\w+\s+\d{4}\b/i.test(text)) date = text;
+    else if (!summary) summary = text;
+  });
+
+  // jangan skip hanya karena summary kosong; minimal title & link
+  if (!title || !link) return null;
+  return { title, link, image, category, date, summary };
+}
+
+// Batching paralel terbatas (untuk fetch detail, dsb)
 async function runParallelWithLimit(tasks, limit = 3) {
   const results = [];
   const executing = new Set();
-
   for (const task of tasks) {
     const p = Promise.resolve().then(() => task());
     results.push(p);
     executing.add(p);
-
     const clean = () => executing.delete(p);
     p.then(clean).catch(clean);
-
-    if (executing.size >= limit) {
-      await Promise.race(executing);
-    }
+    if (executing.size >= limit) await Promise.race(executing);
   }
-
   return Promise.all(results);
 }
 
+// Distributed lock biar job nggak dobel di Railway
+async function withLock(lockKey, ttlSec, fn) {
+  const ok = await redis.set(lockKey, Date.now(), 'NX', 'EX', ttlSec);
+  if (!ok) {
+    console.log(`🔒 Skip: lock ${lockKey} sedang aktif`);
+    return;
+  }
+  try {
+    await fn();
+  } finally {
+    try { await redis.del(lockKey); } catch {}
+  }
+}
 
-// Gunakan variabel lingkungan untuk koneksi fleksibel
-const redis = new Redis(process.env.REDIS_PUBLIC_URL || {
-  host: '127.0.0.1', // Redis lokal
-  port: 6379,
-  retryStrategy: (times) => Math.min(times * 50, 2000) ,
-});
-
-redis.on('connect', () => console.log('✅ Redis connected'));
-redis.on('error', (err) => console.error('❌ Redis error:', err));
-
-
+// ====== NEWS ======
 const newsCategories = [
   'economic-news/economy',
   'economic-news/fiscal-moneter',
@@ -121,287 +160,202 @@ const newsCategories = [
   'analysis/analysis-opinion',
 ];
 
-async function getOrSetCache(key, fetchFn, ttlInSeconds = null) {
-  const cached = await redis.get(key);
-  if (cached) {
-    console.log(`📦 Serving from Redis cache: ${key}`);
-    return JSON.parse(cached);
-  }
-
-  const fresh = await fetchFn();
-  if (ttlInSeconds) {
-    await redis.set(key, JSON.stringify(fresh), 'EX', ttlInSeconds);
-    console.log(`🆕 Cache set for ${key} with TTL ${ttlInSeconds}s`);
-  } else {
-    await redis.set(key, JSON.stringify(fresh));
-    console.log(`🆕 Cache set for ${key} without TTL`);
-  }
-  return fresh;
-}
-
-// =========================
-// Fetch detail news
-// =========================
-async function fetchNewsDetail(url) {
-  try {
+async function fetchNewsDetailSafe(url) {
+  return retryRequest(async () => {
     const { data } = await axios.get(url, {
-          timeout: 720000,
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-        });
+      timeout: 180000, // 3 menit
+      headers: HTML_HEADERS,
+      maxRedirects: 3,
+    });
     const $ = cheerio.load(data);
-    const articleDiv = $('div.article-content').clone();
-    articleDiv.find('span, h3').remove(); // hapus span dengan tanggal + share
-    const plainText = articleDiv.text().trim();
-    return { text: plainText };
-  } catch (err) {
-    console.error(`Failed to fetch detail from ${url}:`, err.message);
-    return { text: null };
-  }
-}
-
-async function fetchNewsDetailID(url) {
-  try {
-    const { data } = await axios.get(url, {
-          timeout: 720000,
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-        });
-    const $ = cheerio.load(data);
-    const articleDiv = $('div.article-content').clone();
-    articleDiv.find('span, h3').remove(); // hapus span dengan tanggal + share
-    const plainText = articleDiv.text().trim();
-    return { text: plainText };
-  } catch (err) {
-    console.error(`Failed to fetch detail from ${url}:`, err.message);
-    return { text: null };
-  }
-}
-
-
-
-
-// =========================
-// Scrape News
-// =========================
-async function scrapeNews() {
-  console.log('🚀 Scraping news EN (parallel)...');
-  const pageLimit = 5;
-  const allTasks = [];
-
-  try {
-    for (const cat of newsCategories) {
-      for (let i = 0; i < pageLimit; i++) {
-        const offset = i * 10;
-        const url = `https://www.newsmaker.id/index.php/en/${cat}?start=${offset}`;
-        allTasks.push(async () => {
-          try {
-            const { data } = await axios.get(url, {
-              timeout: 1200000,
-              headers: { 'User-Agent': 'Mozilla/5.0' },
-            });
-
-            const $ = cheerio.load(data);
-            const items = [];
-
-            $('div.single-news-item').each((_, el) => {
-              const title = $(el).find('h5.card-title a').text().trim();
-              const link = 'https://www.newsmaker.id' + $(el).find('h5.card-title a').attr('href');
-              const image = 'https://www.newsmaker.id' + $(el).find('img.card-img').attr('src');
-              const category = $(el).find('span.category-label').text().trim();
-
-              let date = '';
-              let summary = '';
-
-              $(el).find('p.card-text').each((_, p) => {
-                const text = $(p).text().trim();
-                if (/\d{1,2} \w+ \d{4}/.test(text)) date = text;
-                else summary = text;
-              });
-
-              if (title && link && summary) {
-                items.push({ title, link, image, category, date, summary });
-              }
-            });
-
-            const detailTasks = items.map(item => async () => {
-              try {
-                const exists = await News.findOne({ where: { link: item.link } });
-                if (exists) {
-                  console.log(`⏭️ Skipped (already in DB): ${item.title}`);
-                  return null;
-                }
-
-                const detail = await fetchNewsDetailSafe(item.link);
-                return { ...item, detail };
-              } catch (err) {
-                console.warn(`⚠️ Failed to fetch detail for ${item.link}: ${err.message}`);
-                return null;
-              }
-            });
-
-            const detailedItems = (await runParallelWithLimit(detailTasks, 3)).filter(Boolean);
-            console.log(`🔎 ${cat} [EN] → ${detailedItems.length} new item(s) scraped`);
-            return detailedItems;
-          } catch (err) {
-            console.warn(`⚠️ Failed to scrape page: ${url} | ${err.message}`);
-            return [];
-          }
-        });
-      }
+    if (isWafOrChallenge($)) {
+      console.warn(`🛡️ WAF/Challenge terdeteksi saat ambil detail: ${url}`);
+      return { text: '' };
     }
+    const articleDiv = $('div.article-content').clone();
+    articleDiv.find('span, h3').remove();
+    const plainText = articleDiv.text().trim();
+    return { text: plainText };
+  }, 3, 1000);
+}
 
-    const pageResults = await runParallelWithLimit(allTasks, 2);
-    const flatResults = pageResults.flat();
+const MAX_PAGES_PER_CAT = 200;
+const PAGE_SIZE = 10;
+const MAX_PAGE_EMPTY_STREAK = 3;
 
-    cachedNews = flatResults;
+// Core: scrape per bahasa (anti-duplikat + no-skip + pagination aman)
+async function scrapeNewsByLang(lang = 'en') {
+  console.log(`🚀 Scraping news (${lang}) with de-dup & no-skip...`);
 
-    for (const item of flatResults) {
+  // Ambil link yang sudah ada di DB untuk bahasa ini
+  const { Op } = require('sequelize');
+  const existing = await News.findAll({
+    where: { language: lang },
+    attributes: ['link'],
+    raw: true,
+  });
+  const existingLinks = new Set(existing.map((r) => r.link));
+  const seenLinks = new Set(); // de-dup di sesi ini
+  const allNewItems = [];
+
+  for (const cat of newsCategories) {
+    let start = 0;
+    let emptyStreak = 0;
+    let pageCount = 0;
+
+    while (pageCount < MAX_PAGES_PER_CAT) {
+      const url = `https://www.newsmaker.id/index.php/${lang}/${cat}?start=${start}`;
       try {
-        await News.create({
-          title: item.title,
-          link: item.link,
-          image: item.image,
-          category: item.category,
-          date: item.date,
-          summary: item.summary,
-          detail: item.detail?.text || '',
-          language: 'en'
+        const { data } = await retryRequest(
+          () =>
+            axios.get(url, {
+              timeout: 180000,
+              headers: HTML_HEADERS,
+              maxRedirects: 3,
+            }),
+          3,
+          1000
+        );
+
+        const $ = cheerio.load(data);
+        if (isWafOrChallenge($)) {
+          console.warn(`🛡️ WAF/Challenge terdeteksi di list page: ${url}`);
+          // anggap kosong agar tidak infinite loop
+          emptyStreak++;
+          if (emptyStreak >= MAX_PAGE_EMPTY_STREAK) break;
+          start += PAGE_SIZE;
+          pageCount++;
+          await delay(200);
+          continue;
+        }
+
+        const items = [];
+        $('div.single-news-item').each((_, el) => {
+          const item = extractNewsItem($, el);
+          if (item) items.push(item);
         });
-        console.log(`✅ [EN] Saved to DB: ${item.title}`);
-      } catch (err) {
-        console.error(`❌ [EN] Failed to save: ${item.title} - ${err.message}`);
+
+        const foundCount = items.length;
+        const wouldBeInDb = items.filter((it) => existingLinks.has(it.link)).length;
+        const wouldBeDup = items.filter((it) => seenLinks.has(it.link)).length;
+
+        // filter fresh
+        const fresh = items.filter(
+          (it) => !existingLinks.has(it.link) && !seenLinks.has(it.link)
+        );
+        fresh.forEach((it) => seenLinks.add(it.link));
+
+        console.log(
+          `${cat} [${lang}] start=${start} → found=${foundCount}, inDB=${wouldBeInDb}, dupSession=${wouldBeDup}, fresh=${fresh.length}`
+        );
+
+        if (fresh.length === 0) {
+          emptyStreak++;
+          if (emptyStreak >= MAX_PAGE_EMPTY_STREAK) break;
+        } else {
+          emptyStreak = 0;
+          // ambil detail dgn paralel terbatas
+          const detailTasks = fresh.map((it) => async () => {
+            const detail = await fetchNewsDetailSafe(it.link);
+            return { ...it, detail: detail?.text || '' };
+          });
+          const detailed = (await runParallelWithLimit(detailTasks, 4)).filter(Boolean);
+          allNewItems.push(...detailed);
+        }
+
+        start += PAGE_SIZE;
+        pageCount++;
+        await delay(120); // santun
+      } catch (e) {
+        console.warn(`⚠️ Gagal ambil halaman: ${url} | ${e.message}`);
+        emptyStreak++;
+        if (emptyStreak >= MAX_PAGE_EMPTY_STREAK) break;
+        start += PAGE_SIZE;
+        pageCount++;
+        await delay(300);
       }
     }
+  }
 
+  if (allNewItems.length > 0) {
+    try {
+      await News.bulkCreate(
+        allNewItems.map((n) => ({
+          title: n.title,
+          link: n.link,
+          image: n.image,
+          category: n.category,
+          date: n.date,
+          summary: n.summary,
+          detail: n.detail || '',
+          language: lang,
+        })),
+        { ignoreDuplicates: true } // efektif jika ada unique index (link) atau (link, language)
+      );
+      console.log(`✅ [${lang}] Saved to DB: ${allNewItems.length} rows (ignoreDuplicates)`);
+    } catch (err) {
+      console.error(`❌ [${lang}] bulkCreate failed: ${err.message}`);
+      // fallback upsert per item
+      for (const n of allNewItems) {
+        try {
+          await News.upsert({
+            title: n.title,
+            link: n.link,
+            image: n.image,
+            category: n.category,
+            date: n.date,
+            summary: n.summary,
+            detail: n.detail || '',
+            language: lang,
+          });
+        } catch (e) {
+          console.error(`❌ upsert gagal untuk ${n.link}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  if (lang === 'en') {
+    cachedNews = allNewItems;
     lastUpdatedNews = new Date();
     const keys = await redis.keys('news:*');
-    if (keys.length > 0) await redis.del(...keys);
-
+    if (keys.length) await redis.del(...keys);
     console.log(`✅ News EN updated (${cachedNews.length} items)`);
-  } catch (err) {
-    console.error('❌ scrapeNewsEN failed:', err.message);
-  }
-}
-
-
-async function scrapeNewsID() {
-  console.log('🚀 Scraping news ID (parallel)...');
-  const pageLimit = 5;
-  const allTasks = [];
-
-  try {
-    for (const cat of newsCategories) {
-      for (let i = 0; i < pageLimit; i++) {
-        const offset = i * 10;
-        const url = `https://www.newsmaker.id/index.php/id/${cat}?start=${offset}`;
-        allTasks.push(async () => {
-          try {
-            const { data } = await axios.get(url, {
-              timeout: 1200000,
-              headers: { 'User-Agent': 'Mozilla/5.0' },
-            });
-
-            const $ = cheerio.load(data);
-            const items = [];
-
-            $('div.single-news-item').each((_, el) => {
-              const title = $(el).find('h5.card-title a').text().trim();
-              const link = 'https://www.newsmaker.id' + $(el).find('h5.card-title a').attr('href');
-              const image = 'https://www.newsmaker.id' + $(el).find('img.card-img').attr('src');
-              const category = $(el).find('span.category-label').text().trim();
-
-              let date = '';
-              let summary = '';
-
-              $(el).find('p.card-text').each((_, p) => {
-                const text = $(p).text().trim();
-                if (/\d{1,2} \w+ \d{4}/.test(text)) date = text;
-                else summary = text;
-              });
-
-              if (title && link && summary) {
-                items.push({ title, link, image, category, date, summary });
-              }
-            });
-
-            const detailTasks = items.map(item => async () => {
-              try {
-                const exists = await News.findOne({ where: { link: item.link } });
-                if (exists) {
-                  console.log(`⏭️ Skipped (already in DB): ${item.title}`);
-                  return null;
-                }
-
-                const detail = await fetchNewsDetailSafe(item.link);
-                return { ...item, detail };
-              } catch (err) {
-                console.warn(`⚠️ Failed to fetch detail for ${item.link}: ${err.message}`);
-                return null;
-              }
-            });
-
-            const detailedItems = (await runParallelWithLimit(detailTasks, 3)).filter(Boolean);
-            console.log(`🔎 ${cat} [ID] → ${detailedItems.length} new item(s) scraped`);
-            return detailedItems;
-          } catch (err) {
-            console.warn(`⚠️ Failed to scrape page: ${url} | ${err.message}`);
-            return [];
-          }
-        });
-      }
-    }
-
-    const pageResults = await runParallelWithLimit(allTasks, 2);
-    const flatResults = pageResults.flat();
-
-    cachedNewsID = flatResults;
-
-    for (const item of flatResults) {
-      try {
-        await News.create({
-          title: item.title,
-          link: item.link,
-          image: item.image,
-          category: item.category,
-          date: item.date,
-          summary: item.summary,
-          detail: item.detail?.text || '',
-          language: 'id'
-        });
-        console.log(`✅ [ID] Saved to DB: ${item.title}`);
-      } catch (err) {
-        console.error(`❌ [ID] Failed to save: ${item.title} - ${err.message}`);
-      }
-    }
-
+  } else {
+    cachedNewsID = allNewItems;
     lastUpdatedNewsID = new Date();
     const keys = await redis.keys('newsID:*');
-    if (keys.length > 0) await redis.del(...keys);
-
+    if (keys.length) await redis.del(...keys);
     console.log(`✅ News ID updated (${cachedNewsID.length} items)`);
-  } catch (err) {
-    console.error('❌ scrapeNewsID failed:', err.message);
   }
 }
 
+// Wrapper untuk dipakai scheduler/endpoint
+async function scrapeNews() {
+  return withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
+}
+async function scrapeNewsID() {
+  return withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
+}
 
-// =========================
-// Scrape Calendar
-// =========================
+// ===== Calendar =====
 async function scrapeCalendar() {
   console.log('Scraping calendar with Puppeteer...');
   let browser;
   try {
     browser = await puppeteer.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
 
     const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36');
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36'
+    );
 
     await page.goto('https://www.newsmaker.id/index.php/en/analysis/economic-calendar', {
       waitUntil: 'networkidle2',
-      timeout: 60000
+      timeout: 60000,
     });
 
     await page.waitForSelector('table');
@@ -420,7 +374,6 @@ async function scrapeCalendar() {
         const impact = impactSpan ? impactSpan.innerText.trim() : null;
         const raw = tds[3].innerText.trim();
 
-        // Skip invalid rows
         if (!time || !currency || !impact || !raw || raw === '-' || currency === '-' || raw.includes('2025-')) {
           continue;
         }
@@ -438,15 +391,7 @@ async function scrapeCalendar() {
           actual = actMatch ? actMatch[1].trim() : '-';
         }
 
-        results.push({
-          time,
-          currency,
-          impact,
-          event,
-          previous,
-          forecast,
-          actual
-        });
+        results.push({ time, currency, impact, event, previous, forecast, actual });
       }
       return results;
     });
@@ -457,52 +402,49 @@ async function scrapeCalendar() {
     console.log(`✅ Calendar updated (${cachedCalendar.length} valid events)`);
 
     try {
-      await redis.set('calendar:all', JSON.stringify({
-        status: 'success',
-        updatedAt: lastUpdatedCalendar,
-        total: cachedCalendar.length,
-        data: cachedCalendar
-      }), 'EX', 60 * 15);
-
+      await redis.set(
+        'calendar:all',
+        JSON.stringify({
+          status: 'success',
+          updatedAt: lastUpdatedCalendar,
+          total: cachedCalendar.length,
+          data: cachedCalendar,
+        }),
+        'EX',
+        60 * 15
+      );
       console.log('🧠 Calendar data saved to Redis with TTL 15 minutes');
     } catch (err) {
       console.error('❌ Failed to save calendar to Redis:', err.message);
     }
-    } catch (err) {
-        if (browser) await browser.close();
-        console.error('❌ Calendar scraping failed:', err.message);
-    }
-
+  } catch (err) {
+    if (browser) await browser.close();
+    console.error('❌ Calendar scraping failed:', err.message);
+  }
 }
 
-
-// =========================
-// Scrape Live Quotes
-// =========================
-
-// Function to process the live quotes
+// ===== Live Quotes =====
 async function scrapeQuotes() {
   console.log('Scraping quotes from JSON endpoint...');
-  const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIQ5+LCOPV5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
+  const url =
+    'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIQ5+LCOPV5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
   try {
     const { data } = await axios.get(url);
     const quotes = [];
     for (let i = 1; i <= data[0].count; i++) {
-      // Use `last` as a fallback for high, low, and open if they are 0 or missing
       let high = data[i].high !== 0 ? data[i].high : data[i].last;
       let low = data[i].low !== 0 ? data[i].low : data[i].last;
       let open = data[i].open !== 0 ? data[i].open : data[i].last;
 
-      // Push the valid data into the quotes array
       quotes.push({
         symbol: data[i].symbol,
         last: data[i].last,
-        high: high,
-        low: low,
-        open: open,
+        high,
+        low,
+        open,
         prevClose: data[i].prevClose,
         valueChange: data[i].valueChange,
-        percentChange: data[i].percentChange
+        percentChange: data[i].percentChange,
       });
     }
     cachedQuotes = quotes;
@@ -513,121 +455,81 @@ async function scrapeQuotes() {
   }
 }
 
-
-
-// =========================
-// Historical Scraper (Multi Symbol + Pages)
-// =========================
-
+// ===== Historical =====
 const BASE_URL = 'https://newsmaker.id/index.php/en/historical-data-2';
 const MAX_CONCURRENT_SCRAPES = 10;
-
 
 let cachedSymbols = null;
 let cachedSymbolsTimestamp = 0;
 
-// === UTILITY ===
-// === IMPROVED PARSE NUMBER FUNCTION ===
 function parseNumber(str) {
-  // Handle undefined, null, or empty string
-  if (str === undefined || str === null || str === '') {
-    return null;
-  }
-  
-  // Convert to string if not already
+  if (str === undefined || str === null || str === '') return null;
   str = String(str);
-  
-  // Remove commas and trim whitespace
   const cleaned = str.replace(/,/g, '').trim();
-  
-  // Return null for empty string after cleaning
-  if (cleaned === '' || cleaned === '-') {
-    return null;
-  }
-  
-  // Parse the number
+  if (cleaned === '' || cleaned === '-') return null;
   const parsed = parseFloat(cleaned);
-  
-  // Return null if parsing failed (NaN)
   return isNaN(parsed) ? null : parsed;
 }
 
-// === 1. GET ALL SYMBOLS ===
 async function getAllSymbols() {
   const now = Date.now();
-  if (cachedSymbols && (now - cachedSymbolsTimestamp)) {
+  if (cachedSymbols && now - cachedSymbolsTimestamp) {
     console.log(`🟡 Using cached symbols: ${cachedSymbols.length}`);
     return cachedSymbols;
   }
-
-  const { data } = await axios.get(BASE_URL);
+  const { data } = await axios.get(BASE_URL, { headers: HTML_HEADERS });
   const $ = cheerio.load(data);
   const options = $('select[name="cid"] option');
   const symbols = [];
-
   options.each((_, el) => {
     const cid = $(el).attr('value');
     const name = $(el).text().trim();
     if (cid && name) symbols.push({ cid, name });
   });
-
   console.log(`✅ Fetched ${symbols.length} symbols from base URL`);
   cachedSymbols = symbols;
   cachedSymbolsTimestamp = now;
   return symbols;
 }
 
-// === 2. SCRAPE SINGLE PAGE ===
 async function scrapePageForSymbol(cid, start, retries = 3, backoff = 1000) {
   try {
     const url = `${BASE_URL}?cid=${cid}&period=d&start=${start}`;
     console.log(`📄 Scraping page for cid=${cid} start=${start}`);
     const { data } = await axios.get(url, {
       timeout: 120000,
-      headers: { 'User-Agent': 'Mozilla/5.0' },
+      headers: HTML_HEADERS,
+      maxRedirects: 3,
     });
 
     const $ = cheerio.load(data);
-    
-    // More specific table selector
     const table = $('table.table.table-striped.table-bordered');
     if (table.length === 0) {
       console.warn(`⚠️ No table found for cid=${cid} start=${start}`);
       return [];
     }
 
-    // Get headers
-    const headers = table.find('thead tr th')
-      .map((_, el) => $(el).text().trim().toLowerCase())
-      .get();
-    
-    // console.log(`📋 Headers for cid=${cid}:`, headers);
-
-    // Get rows
     const rows = table.find('tbody tr');
     const result = [];
 
     rows.each((i, row) => {
       const $row = $(row);
       const cols = $row.find('td');
-      
-      // Check if this is an event row (has colspan)
+
       let hasColspan = false;
       cols.each((_, col) => {
         if ($(col).attr('colspan')) {
           hasColspan = true;
-          return false; // break out of each loop
+          return false;
         }
       });
-      
+
       if (hasColspan) {
-        // Handle event rows
         const date = cols.first().text().trim();
         const event = cols.last().text().trim();
-        
         result.push({
-          date: date,
-          event: event,
+          date,
+          event,
           open: null,
           high: null,
           low: null,
@@ -636,53 +538,42 @@ async function scrapePageForSymbol(cid, start, retries = 3, backoff = 1000) {
           volume: null,
           openInterest: null,
         });
-        
-        console.log(`📅 Event row found: ${date} - ${event}`);
         return;
       }
 
-      // Regular data rows
       const textCols = cols.map((_, el) => $(el).text().trim()).get();
-      
-      if (textCols.length === 0) {
-        console.warn(`⚠️ Empty row found for cid=${cid}`);
-        return;
-      }
+      if (textCols.length === 0) return;
 
-      // Parse regular data row with flexible column handling
       const rowData = {
         date: textCols[0] || null,
         open: parseNumber(textCols[1]),
         high: parseNumber(textCols[2]),
         low: parseNumber(textCols[3]),
         close: parseNumber(textCols[4]),
-        change: textCols[5] || null, // Keep as string (can be +/-)
+        change: textCols[5] || null,
         volume: parseNumber(textCols[6]),
         openInterest: parseNumber(textCols[7]),
       };
 
-      // Additional validation - at least date and one price should be valid
-      if (rowData.date && (rowData.open !== null || rowData.close !== null || 
-                          rowData.high !== null || rowData.low !== null)) {
+      if (
+        rowData.date &&
+        (rowData.open !== null ||
+          rowData.close !== null ||
+          rowData.high !== null ||
+          rowData.low !== null)
+      ) {
         result.push(rowData);
-      } else {
-        console.warn(`⚠️ Invalid row data for cid=${cid}:`, textCols);
       }
     });
 
     console.log(`✅ Scraped ${result.length} rows for cid=${cid} start=${start}`);
-    
-    // Log sample data for debugging
-    // if (result.length > 0) {
-    //   console.log(`📊 Sample row for cid=${cid}:`, result[0]);
-    // }
-    
     return result;
-    
   } catch (err) {
     if (retries > 0) {
-      console.warn(`⏳ Retry scraping cid=${cid} start=${start}, left: ${retries}, error: ${err.message}`);
-      await new Promise(resolve => setTimeout(resolve, backoff));
+      console.warn(
+        `⏳ Retry scraping cid=${cid} start=${start}, left: ${retries}, error: ${err.message}`
+      );
+      await delay(backoff);
       return scrapePageForSymbol(cid, start, retries - 1, backoff * 2);
     } else {
       console.error(`❌ Failed to scrape cid=${cid} start=${start}:`, err.message);
@@ -691,75 +582,40 @@ async function scrapePageForSymbol(cid, start, retries = 3, backoff = 1000) {
   }
 }
 
-
-
-// === IMPROVED SCRAPE ALL DATA FOR A SYMBOL ===
 async function scrapeAllDataForSymbol(cid, maxRows = 5000) {
   console.log(`🎯 Starting complete scrape for cid=${cid} (max ${maxRows} rows)`);
   const allData = [];
   let start = 0;
   let pageCount = 0;
   let consecutiveEmptyPages = 0;
-  const PAGE_SIZE = 8; // Default page size
-  const MAX_PAGES_PER_SYMBOL = 500; // Safety limit
+  const PAGE_SIZE = 8;
+  const MAX_PAGES_PER_SYMBOL = 500;
 
   while (true) {
-    // Check if we've reached the maximum rows limit
-    if (allData.length >= maxRows) {
-      console.log(`🚧 Max rows limit (${maxRows}) reached for cid=${cid}`);
-      break;
-    }
-    
-    if (pageCount >= MAX_PAGES_PER_SYMBOL) {
-      console.warn(`🚧 Max page limit (${MAX_PAGES_PER_SYMBOL}) reached for cid=${cid}`);
-      break;
-    }
-    
+    if (allData.length >= maxRows) break;
+    if (pageCount >= MAX_PAGES_PER_SYMBOL) break;
+
     const pageData = await scrapePageForSymbol(cid, start);
-    
     if (pageData.length === 0) {
       consecutiveEmptyPages++;
       console.log(`📭 Empty page ${consecutiveEmptyPages} for cid=${cid} at start=${start}`);
-      
-      if (consecutiveEmptyPages >= 3) {
-        console.log(`🛑 Multiple empty pages, stopping scrape for cid=${cid}`);
-        break;
-      }
+      if (consecutiveEmptyPages >= 3) break;
     } else {
-      consecutiveEmptyPages = 0; // Reset counter
-      
-      // Add data but respect the maxRows limit
-      const remainingSlots = maxRows - allData.length;
-      const dataToAdd = pageData.slice(0, remainingSlots);
-      allData.push(...dataToAdd);
-      
-      console.log(`📈 Total data so far for cid=${cid}: ${allData.length} rows`);
-      
-      // If we've reached the limit, stop
-      if (allData.length >= maxRows) {
-        console.log(`🎯 Reached max rows limit (${maxRows}) for cid=${cid}`);
-        break;
-      }
-    }
-    
-    // If we got less than PAGE_SIZE, we're probably at the end
-    if (pageData.length < PAGE_SIZE) {
-      console.log(`🏁 Reached end of data for cid=${cid} (got ${pageData.length} rows)`);
-      break;
+      consecutiveEmptyPages = 0;
+      const remaining = maxRows - allData.length;
+      allData.push(...pageData.slice(0, remaining));
+      if (allData.length >= maxRows) break;
     }
 
+    if (pageData.length < PAGE_SIZE) break;
     start += PAGE_SIZE;
     pageCount++;
-    
-    // Add small delay to be respectful to the server
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await delay(100);
   }
 
   console.log(`🎉 Completed scraping cid=${cid}: ${allData.length} total rows`);
   return allData;
 }
-
-
 
 async function scrapeAllHistoricalData() {
   console.log('📊 Scraping all historical data...');
@@ -784,14 +640,10 @@ async function scrapeAllHistoricalData() {
         const data = await scrapeAllDataForSymbol(cid);
         console.log(`✅ ${name}: ${data.length} rows`);
 
-        // 💾 Simpan ke DB
         for (const row of data) {
           try {
             const [record, created] = await HistoricalData.findOrCreate({
-              where: {
-                symbol: name,
-                date: row.date
-              },
+              where: { symbol: name, date: row.date },
               defaults: {
                 event: row.event || null,
                 open: row.open,
@@ -800,8 +652,8 @@ async function scrapeAllHistoricalData() {
                 close: row.close,
                 change: row.change,
                 volume: row.volume,
-                openInterest: row.openInterest
-              }
+                openInterest: row.openInterest,
+              },
             });
 
             if (created) {
@@ -809,13 +661,11 @@ async function scrapeAllHistoricalData() {
             } else {
               console.log(`⏭️ Skipped (exists): ${name} (${row.date})`);
             }
-
           } catch (err) {
             console.error(`❌ Failed to save row for ${name} (${row.date}): ${err.message}`);
           }
         }
 
-        // Optional: Cache juga ke Redis
         const cacheKey = `historical:${name.toLowerCase()}:all`;
         try {
           await redis.set(
@@ -832,34 +682,25 @@ async function scrapeAllHistoricalData() {
     )
   );
 
-
   console.log('🎉 All scraping completed.');
   return true;
 }
 
-  
-
-
-
-// =========================
-// Schedule scraper
-// =========================
-scrapeNews();
-scrapeNewsID();
+// ===== Schedulers (pakai lock) =====
+withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
+withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
 scrapeCalendar();
 scrapeQuotes();
-scrapeAllHistoricalData();
+withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
 
-setInterval(scrapeAllHistoricalData, 240 * 60 * 1000); // Run every hour
-setInterval(scrapeNews, 10 * 60 * 1000);
-setInterval(scrapeNewsID, 10 * 60 * 1000);
-setInterval(scrapeCalendar, 60 * 60 * 1000);
-setInterval(scrapeQuotes, 0.15 * 60 * 1000);
+// Note: 60*60*1000 = 1 jam
+setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData()), 4 * 60 * 60 * 1000); // tiap 4 jam
+setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 10 * 60 * 1000); // 10 menit
+setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 10 * 60 * 1000); // 10 menit
+setInterval(scrapeCalendar, 60 * 60 * 1000); // 1 jam
+setInterval(scrapeQuotes, 0.15 * 60 * 1000); // 9 detik
 
-
-// =========================
-// API Endpoints
-// =========================
+// ===== API =====
 app.get('/api/news', async (req, res) => {
   const { category = 'all', search = '' } = req.query;
   const { Op } = require('sequelize');
@@ -875,21 +716,13 @@ app.get('/api/news', async (req, res) => {
       ];
     }
 
-    const results = await News.findAll({
-      where,
-      order: [['createdAt', 'DESC']],
-    });
+    const results = await News.findAll({ where, order: [['createdAt', 'DESC']] });
 
-    res.json({
-      status: 'success',
-      total: results.length,
-      data: results,
-    });
+    res.json({ status: 'success', total: results.length, data: results });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 app.get('/api/news-id', async (req, res) => {
   const { category = 'all', search = '' } = req.query;
@@ -906,21 +739,13 @@ app.get('/api/news-id', async (req, res) => {
       ];
     }
 
-    const results = await News.findAll({
-      where,
-      order: [['createdAt', 'DESC']],
-    });
+    const results = await News.findAll({ where, order: [['createdAt', 'DESC']] });
 
-    res.json({
-      status: 'success',
-      total: results.length,
-      data: results,
-    });
+    res.json({ status: 'success', total: results.length, data: results });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 app.get('/api/calendar', async (req, res) => {
   try {
@@ -930,18 +755,15 @@ app.get('/api/calendar', async (req, res) => {
       return res.json(JSON.parse(cached));
     }
 
-    // Fallback: scrape kalau cache kosong
     await scrapeCalendar();
     const freshData = {
       status: 'success',
       updatedAt: lastUpdatedCalendar,
       total: cachedCalendar.length,
-      data: cachedCalendar
+      data: cachedCalendar,
     };
 
-    // Simpan ke Redis juga untuk next request
     await redis.set('calendar:all', JSON.stringify(freshData), 'EX', 60 * 60);
-
     res.json(freshData);
   } catch (err) {
     console.error('❌ Error in /api/calendar:', err.message);
@@ -949,21 +771,17 @@ app.get('/api/calendar', async (req, res) => {
   }
 });
 
-
 app.get('/api/historical', async (req, res) => {
   try {
-    // Get all keys matching historical:*
     const keys = await redis.keys('historical:*');
     if (keys.length === 0) {
       return res.status(404).json({ status: 'empty', message: 'No historical data cached yet.' });
     }
 
-    // Fetch all cached data
     const pipeline = redis.pipeline();
-    keys.forEach(key => pipeline.get(key));
+    keys.forEach((key) => pipeline.get(key));
     const results = await pipeline.exec();
 
-    // Aggregate data
     const allData = [];
     results.forEach(([err, data]) => {
       if (!err && data) {
@@ -986,23 +804,17 @@ app.get('/api/historical', async (req, res) => {
 });
 
 app.get('/api/quotes', (req, res) => {
-  // Cek jika cachedQuotes kosong atau belum ada update
   if (cachedQuotes.length === 0) {
     return res.status(404).json({ status: 'error', message: 'No quotes data available' });
   }
 
-  // Validasi data sebelum mengirim ke client
-  const validQuotes = cachedQuotes.map((quote) => {
-    // Cek dan fallback jika data high, low, atau open masih 0
-    return {
-      ...quote,
-      high: quote.high !== 0 ? quote.high : quote.last,  // fallback ke 'last' jika 'high' 0
-      low: quote.low !== 0 ? quote.low : quote.last,    // fallback ke 'last' jika 'low' 0
-      open: quote.open !== 0 ? quote.open : quote.last    // fallback ke 'last' jika 'open' 0
-    };
-  });
+  const validQuotes = cachedQuotes.map((q) => ({
+    ...q,
+    high: q.high !== 0 ? q.high : q.last,
+    low: q.low !== 0 ? q.low : q.last,
+    open: q.open !== 0 ? q.open : q.last,
+  }));
 
-  // Kirim data yang sudah tervalidasi
   res.json({
     status: 'success',
     updatedAt: lastUpdatedQuotes,
@@ -1011,24 +823,15 @@ app.get('/api/quotes', (req, res) => {
   });
 });
 
-
 app.delete('/api/cache', async (req, res) => {
   try {
     const { pattern } = req.query;
-
-    // Default pattern: semua key dengan prefix "historical:"
     const keyPattern = pattern || 'historical:*';
-
-    // Ambil semua key yang cocok
     const keys = await redis.keys(keyPattern);
 
-    if (keys.length === 0) {
-      return res.json({ message: 'No cache keys found.' });
-    }
+    if (keys.length === 0) return res.json({ message: 'No cache keys found.' });
 
-    // Hapus semua key
     await redis.del(...keys);
-
     res.json({ message: `🧹 ${keys.length} cache key(s) deleted.` });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1045,12 +848,10 @@ app.get('/api/status', (req, res) => {
       news: lastUpdatedNews,
       newsID: lastUpdatedNewsID,
       calendar: lastUpdatedCalendar,
-      quotes: lastUpdatedQuotes
-    }
+      quotes: lastUpdatedQuotes,
+    },
   });
 });
-
-
 
 app.listen(PORT, () => {
   console.log(`🚀 Server ready at http://localhost:${PORT}`);
