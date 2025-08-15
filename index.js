@@ -771,56 +771,67 @@ app.get('/api/calendar', async (req, res) => {
   }
 });
 
-app.get('/api/historical', async (req, res) => {
+// ===== REFACTORED: QUOTES NO-CACHE =====
+app.get('/api/quotes', async (req, res) => {
   try {
-    const keys = await redis.keys('historical:*');
-    if (keys.length === 0) {
-      return res.status(404).json({ status: 'empty', message: 'No historical data cached yet.' });
+    const url =
+      'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIQ5+LCOPV5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
+
+    // Always fetch fresh from source (no cache usage)
+    const { data } = await axios.get(url, { timeout: 15000 });
+
+    const quotes = [];
+    for (let i = 1; i <= data[0].count; i++) {
+      const high = data[i].high !== 0 ? data[i].high : data[i].last;
+      const low = data[i].low !== 0 ? data[i].low : data[i].last;
+      const open = data[i].open !== 0 ? data[i].open : data[i].last;
+
+      quotes.push({
+        symbol: data[i].symbol,
+        last: data[i].last,
+        high,
+        low,
+        open,
+        prevClose: data[i].prevClose,
+        valueChange: data[i].valueChange,
+        percentChange: data[i].percentChange,
+      });
     }
 
-    const pipeline = redis.pipeline();
-    keys.forEach((key) => pipeline.get(key));
-    const results = await pipeline.exec();
-
-    const allData = [];
-    results.forEach(([err, data]) => {
-      if (!err && data) {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.data && Array.isArray(parsed.data)) {
-            allData.push({ symbol: parsed.symbol, data: parsed.data, updatedAt: parsed.updatedAt });
-          }
-        } catch (e) {
-          console.error('Error parsing cached historical data:', e.message);
-        }
-      }
+    return res.json({
+      status: 'success',
+      updatedAt: new Date(),
+      total: quotes.length,
+      data: quotes,
+      source: 'live', // penanda live fetch
     });
-
-    res.json({ status: 'success', totalSymbols: allData.length, data: allData });
   } catch (err) {
-    console.error('❌ Error in /api/historical:', err.message);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('❌ Live quotes fetch failed:', err.message);
+
+    // --- OPSIONAL: Fallback ke cache RAM kalau ada (boleh dihapus kalau mau pure no-cache) ---
+    if (Array.isArray(cachedQuotes) && cachedQuotes.length > 0) {
+      const validQuotes = cachedQuotes.map((q) => ({
+        ...q,
+        high: q.high !== 0 ? q.high : q.last,
+        low: q.low !== 0 ? q.low : q.last,
+        open: q.open !== 0 ? q.open : q.last,
+      }));
+      return res.json({
+        status: 'degraded',
+        updatedAt: lastUpdatedQuotes,
+        total: validQuotes.length,
+        data: validQuotes,
+        source: 'fallback-cache',
+      });
+    }
+    // -----------------------------------------------------------------------------------------
+
+    return res.status(502).json({
+      status: 'error',
+      message: 'Failed to fetch live quotes',
+      detail: err.message,
+    });
   }
-});
-
-app.get('/api/quotes', (req, res) => {
-  if (cachedQuotes.length === 0) {
-    return res.status(404).json({ status: 'error', message: 'No quotes data available' });
-  }
-
-  const validQuotes = cachedQuotes.map((q) => ({
-    ...q,
-    high: q.high !== 0 ? q.high : q.last,
-    low: q.low !== 0 ? q.low : q.last,
-    open: q.open !== 0 ? q.open : q.last,
-  }));
-
-  res.json({
-    status: 'success',
-    updatedAt: lastUpdatedQuotes,
-    total: validQuotes.length,
-    data: validQuotes,
-  });
 });
 
 app.delete('/api/cache', async (req, res) => {
