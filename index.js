@@ -698,7 +698,7 @@ setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData(
 setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 10 * 60 * 1000); // 10 menit
 setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 10 * 60 * 1000); // 10 menit
 setInterval(scrapeCalendar, 60 * 60 * 1000); // 1 jam
-setInterval(scrapeQuotes, 0.15 * 60 * 1000); // 9 detik
+// setInterval(scrapeQuotes, 0.15 * 60 * 1000); // 9 detik
 
 // ===== API =====
 app.get('/api/news', async (req, res) => {
