@@ -424,36 +424,36 @@ async function scrapeCalendar() {
 }
 
 // ===== Live Quotes =====
-async function scrapeQuotes() {
-  console.log('Scraping quotes from JSON endpoint...');
-  const url =
-    'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIQ5+LCOPV5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
-  try {
-    const { data } = await axios.get(url);
-    const quotes = [];
-    for (let i = 1; i <= data[0].count; i++) {
-      let high = data[i].high !== 0 ? data[i].high : data[i].last;
-      let low = data[i].low !== 0 ? data[i].low : data[i].last;
-      let open = data[i].open !== 0 ? data[i].open : data[i].last;
+// async function scrapeQuotes() {
+//   console.log('Scraping quotes from JSON endpoint...');
+//   const url =
+//     'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIQ5+LCOPV5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
+//   try {
+//     const { data } = await axios.get(url);
+//     const quotes = [];
+//     for (let i = 1; i <= data[0].count; i++) {
+//       let high = data[i].high !== 0 ? data[i].high : data[i].last;
+//       let low = data[i].low !== 0 ? data[i].low : data[i].last;
+//       let open = data[i].open !== 0 ? data[i].open : data[i].last;
 
-      quotes.push({
-        symbol: data[i].symbol,
-        last: data[i].last,
-        high,
-        low,
-        open,
-        prevClose: data[i].prevClose,
-        valueChange: data[i].valueChange,
-        percentChange: data[i].percentChange,
-      });
-    }
-    cachedQuotes = quotes;
-    lastUpdatedQuotes = new Date();
-    console.log(`✅ Quotes updated (${quotes.length} items)`);
-  } catch (err) {
-    console.error('❌ Quotes scraping failed:', err.message);
-  }
-}
+//       quotes.push({
+//         symbol: data[i].symbol,
+//         last: data[i].last,
+//         high,
+//         low,
+//         open,
+//         prevClose: data[i].prevClose,
+//         valueChange: data[i].valueChange,
+//         percentChange: data[i].percentChange,
+//       });
+//     }
+//     cachedQuotes = quotes;
+//     lastUpdatedQuotes = new Date();
+//     console.log(`✅ Quotes updated (${quotes.length} items)`);
+//   } catch (err) {
+//     console.error('❌ Quotes scraping failed:', err.message);
+//   }
+// }
 
 // ===== Historical =====
 const BASE_URL = 'https://newsmaker.id/index.php/en/historical-data-2';
@@ -690,15 +690,15 @@ async function scrapeAllHistoricalData() {
 withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
 withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
 scrapeCalendar();
-scrapeQuotes();
+// scrapeQuotes();
 withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
 
-// Note: 60*60*1000 = 1 jam
+// // Note: 60*60*1000 = 1 jam
 setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData()), 4 * 60 * 60 * 1000); // tiap 4 jam
 setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 10 * 60 * 1000); // 10 menit
 setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 10 * 60 * 1000); // 10 menit
 setInterval(scrapeCalendar, 60 * 60 * 1000); // 1 jam
-setInterval(scrapeQuotes, 0.15 * 60 * 1000); // 9 detik
+// setInterval(scrapeQuotes, 0.15 * 60 * 1000); // 9 detik
 
 // ===== API =====
 app.get('/api/news', async (req, res) => {
@@ -767,6 +767,41 @@ app.get('/api/calendar', async (req, res) => {
     res.json(freshData);
   } catch (err) {
     console.error('❌ Error in /api/calendar:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/historical', async (req, res) => {
+  try {
+    // Get all keys matching historical:*
+    const keys = await redis.keys('historical:*');
+    if (keys.length === 0) {
+      return res.status(404).json({ status: 'empty', message: 'No historical data cached yet.' });
+    }
+
+    // Fetch all cached data
+    const pipeline = redis.pipeline();
+    keys.forEach(key => pipeline.get(key));
+    const results = await pipeline.exec();
+
+    // Aggregate data
+    const allData = [];
+    results.forEach(([err, data]) => {
+      if (!err && data) {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.data && Array.isArray(parsed.data)) {
+            allData.push({ symbol: parsed.symbol, data: parsed.data, updatedAt: parsed.updatedAt });
+          }
+        } catch (e) {
+          console.error('Error parsing cached historical data:', e.message);
+        }
+      }
+    });
+
+    res.json({ status: 'success', totalSymbols: allData.length, data: allData });
+  } catch (err) {
+    console.error('❌ Error in /api/historical:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
