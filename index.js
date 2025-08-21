@@ -772,54 +772,46 @@ app.get('/api/calendar', async (req, res) => {
 });
 
 // GANTI endpoint /api/historical YANG LAMA dengan ini (tanpa Redis)
+// TANPA REDIS: baca langsung dari MySQL
 app.get('/api/historical', async (req, res) => {
   try {
-    const { sequelize } = require('./models');
-    const { fn, col, literal } = sequelize;
-
-    // Ambil daftar simbol distinct
-    const symbolsRaw = await sequelize.models.HistoricalData.findAll({
-      attributes: [[fn('DISTINCT', col('symbol')), 'symbol']],
+    // Ambil daftar simbol distinct dari DB
+    const symbolsRaw = await HistoricalData.findAll({
+      attributes: [[sequelize.fn('DISTINCT', sequelize.col('symbol')), 'symbol']],
       raw: true,
     });
-    const symbols = symbolsRaw.map((r) => r.symbol).filter(Boolean);
+    const symbols = symbolsRaw.map(r => r.symbol).filter(Boolean);
 
-    // Ambil data per simbol dari MySQL
-    // (tanpa Redis, tanpa filter/pagination tambahan — sesuai permintaan)
+    if (symbols.length === 0) {
+      return res.status(404).json({ status: 'empty', message: 'No historical data found in database.' });
+    }
+
+    // Ambil seluruh data per simbol dari DB
     const allData = [];
     for (const symbol of symbols) {
-      const rows = await sequelize.models.HistoricalData.findAll({
-        where: { symbol },
-        order: [['date', 'DESC']], // urut sederhana by kolom 'date' apa adanya
-        raw: true,
-      });
+      const [rows, updatedAt] = await Promise.all([
+        HistoricalData.findAll({
+          where: { symbol },
+          order: [['date', 'DESC']], // urutkan apa adanya sesuai kolom 'date' di DB
+          raw: true,
+        }),
+        HistoricalData.max('updatedAt', { where: { symbol } }),
+      ]);
 
-      // updatedAt: ambil nilai max dari records simbol tsb (kalau ada)
-      let updatedAt = null;
-      for (const r of rows) {
-        if (r.updatedAt && (!updatedAt || new Date(r.updatedAt) > new Date(updatedAt))) {
-          updatedAt = r.updatedAt;
-        }
-      }
-
-      allData.push({
-        symbol,
-        data: rows,
-        updatedAt,
-      });
+      allData.push({ symbol, data: rows, updatedAt });
     }
 
     return res.json({
       status: 'success',
       totalSymbols: allData.length,
-      data: allData,      // sama seperti format sebelumnya, tapi sumber langsung MySQL
-      source: 'mysql',    // penanda internal aja
+      data: allData,
     });
   } catch (err) {
-    console.error('❌ Error in /api/historical (MySQL direct):', err);
-    res.status(500).json({ status: 'error', message: 'Internal server error' });
+    console.error('❌ Error in /api/historical (MySQL direct):', err.message || err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 
 
