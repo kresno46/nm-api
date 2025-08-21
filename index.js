@@ -771,89 +771,56 @@ app.get('/api/calendar', async (req, res) => {
   }
 });
 
-// GANTI endpoint /api/historical YANG LAMA dengan ini
+// GANTI endpoint /api/historical YANG LAMA dengan ini (tanpa Redis)
 app.get('/api/historical', async (req, res) => {
   try {
-    const { Op, literal, col } = require('sequelize');
-    const {
-      symbol,            // e.g. "BCO Daily"
-      startDate,         // e.g. "2025-07-01" (jika kolom DATE) atau "01 Jul 2025" (jika VARCHAR)
-      endDate,           // e.g. "2025-07-31" atau "31 Jul 2025"
-      limit = 200,
-      offset = 0,
-      sort = 'date',     // "date" | "createdAt" | "updatedAt"
-      order = 'DESC',    // "ASC" | "DESC"
-    } = req.query;
+    const { sequelize } = require('./models');
+    const { fn, col, literal } = sequelize;
 
-    // ====== Bangun WHERE ======
-    const where = {};
-    if (symbol) where.symbol = symbol;
-
-    // Deteksi tipe kolom date di model
-    // Catatan: ubah sesuai definisi model bila perlu
-    const dateAttr = HistoricalData.rawAttributes.date;
-    const isDateColumnString = dateAttr && dateAttr.type && dateAttr.type.key === 'STRING';
-
-    if (startDate || endDate) {
-      if (!isDateColumnString) {
-        // Kolom DATE/TIMESTAMP → filter biasa
-        where.date = {};
-        if (startDate) where.date[Op.gte] = startDate;
-        if (endDate) where.date[Op.lte] = endDate;
-      } else {
-        // Kolom VARCHAR → filter pakai STR_TO_DATE
-        // Ekspektasi format: "DD Mon YYYY" (contoh: "31 Jul 2025")
-        // Jika lo kirim startDate/endDate dalam format lain, samakan dulu di sisi caller.
-        const conds = [];
-        if (startDate) {
-          conds.push(literal(`STR_TO_DATE(\`date\`, '%d %b %Y') >= STR_TO_DATE(${sequelize.escape(startDate)}, '%d %b %Y')`));
-        }
-        if (endDate) {
-          conds.push(literal(`STR_TO_DATE(\`date\`, '%d %b %Y') <= STR_TO_DATE(${sequelize.escape(endDate)}, '%d %b %Y')`));
-        }
-        if (conds.length) where[Op.and] = conds;
-      }
-    }
-
-    // ====== Sort ======
-    let orderBy;
-    const normalizedOrder = String(order).toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
-
-    if (sort === 'createdAt' || sort === 'updatedAt') {
-      orderBy = [[sort, normalizedOrder]];
-    } else {
-      // sort by "date"
-      if (!isDateColumnString) {
-        orderBy = [['date', normalizedOrder]];
-      } else {
-        // Kolom date VARCHAR → urutkan via STR_TO_DATE
-        orderBy = [[literal(`STR_TO_DATE(\`date\`, '%d %b %Y') ${normalizedOrder}`)]];
-      }
-    }
-
-    // ====== Query utama (paginated) ======
-    const { rows, count } = await HistoricalData.findAndCountAll({
-      where,
-      limit: Math.min(+limit || 200, 2000),
-      offset: +offset || 0,
-      order: orderBy,
-      // optional: pilih kolom tertentu biar lebih irit payload
-      // attributes: ['symbol','date','open','high','low','close','change','volume','openInterest','createdAt','updatedAt'],
+    // Ambil daftar simbol distinct
+    const symbolsRaw = await sequelize.models.HistoricalData.findAll({
+      attributes: [[fn('DISTINCT', col('symbol')), 'symbol']],
+      raw: true,
     });
+    const symbols = symbolsRaw.map((r) => r.symbol).filter(Boolean);
 
-    res.json({
+    // Ambil data per simbol dari MySQL
+    // (tanpa Redis, tanpa filter/pagination tambahan — sesuai permintaan)
+    const allData = [];
+    for (const symbol of symbols) {
+      const rows = await sequelize.models.HistoricalData.findAll({
+        where: { symbol },
+        order: [['date', 'DESC']], // urut sederhana by kolom 'date' apa adanya
+        raw: true,
+      });
+
+      // updatedAt: ambil nilai max dari records simbol tsb (kalau ada)
+      let updatedAt = null;
+      for (const r of rows) {
+        if (r.updatedAt && (!updatedAt || new Date(r.updatedAt) > new Date(updatedAt))) {
+          updatedAt = r.updatedAt;
+        }
+      }
+
+      allData.push({
+        symbol,
+        data: rows,
+        updatedAt,
+      });
+    }
+
+    return res.json({
       status: 'success',
-      total: count,
-      limit: +limit || 200,
-      offset: +offset || 0,
-      data: rows,
-      source: 'mysql', // penanda bahwa ini direct dari DB
+      totalSymbols: allData.length,
+      data: allData,      // sama seperti format sebelumnya, tapi sumber langsung MySQL
+      source: 'mysql',    // penanda internal aja
     });
   } catch (err) {
     console.error('❌ Error in /api/historical (MySQL direct):', err);
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
+
 
 
 // ===== REFACTORED: QUOTES NO-CACHE =====
