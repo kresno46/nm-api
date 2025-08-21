@@ -771,34 +771,50 @@ app.get('/api/calendar', async (req, res) => {
   }
 });
 
-// GANTI endpoint /api/historical YANG LAMA dengan ini (tanpa Redis)
-// TANPA REDIS: baca langsung dari MySQL
+// /api/historical — MySQL direct, sorted per-symbol by latest date (date = VARCHAR)
 app.get('/api/historical', async (req, res) => {
   try {
-    // Ambil daftar simbol distinct dari DB
-    const symbolsRaw = await HistoricalData.findAll({
-      attributes: [[sequelize.fn('DISTINCT', sequelize.col('symbol')), 'symbol']],
-      raw: true,
-    });
-    const symbols = symbolsRaw.map(r => r.symbol).filter(Boolean);
+    const { QueryTypes } = require('sequelize');
 
-    if (symbols.length === 0) {
-      return res.status(404).json({ status: 'empty', message: 'No historical data found in database.' });
+    const tableName = HistoricalData.getTableName().toString();
+
+    // 1) Urutkan daftar symbol berdasarkan tanggal terbaru masing-masing
+    const orderedSymbols = await sequelize.query(
+      `
+      SELECT
+        symbol,
+        MAX(STR_TO_DATE(\`date\`, '%d %b %Y')) AS latestDate,
+        MAX(updatedAt) AS updatedAtMax
+      FROM \`${tableName}\`
+      GROUP BY symbol
+      ORDER BY latestDate IS NULL, latestDate DESC, updatedAtMax DESC
+      `,
+      { type: QueryTypes.SELECT }
+    );
+
+    if (!orderedSymbols.length) {
+      return res.status(404).json({
+        status: 'empty',
+        message: 'No historical data found in database.',
+      });
     }
 
-    // Ambil seluruh data per simbol dari DB
+    // 2) Ambil data per symbol (urut dari tanggal paling baru)
     const allData = [];
-    for (const symbol of symbols) {
-      const [rows, updatedAt] = await Promise.all([
-        HistoricalData.findAll({
-          where: { symbol },
-          order: [['date', 'DESC']], // urutkan apa adanya sesuai kolom 'date' di DB
-          raw: true,
-        }),
-        HistoricalData.max('updatedAt', { where: { symbol } }),
-      ]);
+    for (const row of orderedSymbols) {
+      const symbol = row.symbol;
 
-      allData.push({ symbol, data: rows, updatedAt });
+      const rows = await HistoricalData.findAll({
+        where: { symbol },
+        order: [[sequelize.literal("STR_TO_DATE(`date`, '%d %b %Y')"), 'DESC']],
+        raw: true,
+      });
+
+      allData.push({
+        symbol,
+        data: rows,
+        updatedAt: row.updatedAtMax || null,
+      });
     }
 
     return res.json({
@@ -807,12 +823,10 @@ app.get('/api/historical', async (req, res) => {
       data: allData,
     });
   } catch (err) {
-    console.error('❌ Error in /api/historical (MySQL direct):', err.message || err);
+    console.error('❌ Error in /api/historical (MySQL direct, varchar date):', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-
 
 
 // ===== REFACTORED: QUOTES NO-CACHE =====
