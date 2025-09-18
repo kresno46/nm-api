@@ -7,15 +7,25 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@google-cloud/translate": "^9.2.0",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0-rc.12",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
+    "crypto": "^1.0.1",
     "dotenv": "^16.0.0",
     "express": "^4.18.2",
-    "ioredis": "^5.6.1",
+    "express-rate-limit": "^8.0.1",
+    "fast-xml-parser": "^5.2.5",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.7.0",
     "mysql2": "^3.14.3",
+    "node-cache": "^5.1.2",
     "puppeteer": "^24.12.0",
     "redis": "^5.5.6",
     "sequelize": "^6.32.1"
+  },
+  "devDependencies": {
+    "sequelize-cli": "^6.6.3"
   }
 }
