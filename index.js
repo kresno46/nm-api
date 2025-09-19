@@ -1149,13 +1149,20 @@ app.get('/api/news', async (req, res) => {
     const attrs = normalizeFields(fields);
 
     const { Op } = require('sequelize');
-    const where = { language: 'en' };
+
+    // ⬇️ cutoff 3 bulan ke belakang
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - 3);
+
+    // ⬇️ filter language + published_at >= cutoff
+    const where = { language: 'en', published_at: { [Op.gte]: cutoff } };
+
     if (category !== 'all') where.category = { [Op.like]: `%${category}%` };
     if (search) {
       where[Op.or] = [
-        { title: { [Op.like]: `%${search}%` } },
+        { title:   { [Op.like]: `%${search}%` } },
         { summary: { [Op.like]: `%${search}%` } },
-        { detail: { [Op.like]: `%${search}%` } },
+        { detail:  { [Op.like]: `%${search}%` } },
       ];
     }
 
@@ -1165,34 +1172,32 @@ app.get('/api/news', async (req, res) => {
     const cached = await redis.get(cacheKey);
     if (cached) return sendWithETag(req, res, JSON.parse(cached), 30);
 
-    // pastikan author_name ada di payload
-const { rows, count } = await News.findAndCountAll({
-  where,
-  attributes: attrs || undefined,
-  order: [
-    ['published_at', 'DESC'],
-    ['createdAt', 'DESC'],
-  ],
-  limit: l,
-  offset: (p - 1) * l,
-});
+    const { rows, count } = await News.findAndCountAll({
+      where,
+      attributes: attrs || undefined,
+      order: [
+        ['published_at', 'DESC'],
+        ['createdAt', 'DESC'],
+      ],
+      limit: l,
+      offset: (p - 1) * l,
+    });
 
-const data = rows.map(r => {
-  const row = r.toJSON ? r.toJSON() : r;
-  if (!row.author_name) row.author_name = toAuthorName(row.author) || null; // ← cek null/empty, bukan "in"
-  return row;
-});
+    const data = rows.map(r => {
+      const row = r.toJSON ? r.toJSON() : r;
+      if (!row.author_name) row.author_name = toAuthorName(row.author) || null;
+      return row;
+    });
 
-
-const payload = { status: 'success', page: p, perPage: l, total: count, data };
+    const payload = { status: 'success', page: p, perPage: l, total: count, data };
     await redis.set(cacheKey, JSON.stringify(payload), 'EX', 45);
-
     return sendWithETag(req, res, payload, 30);
   } catch (err) {
     console.error('❌ /api/news error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // ===== NEWS (ID) - paginated, fields, Redis cache, ETag =====
 app.get('/api/news-id', async (req, res) => {
@@ -1204,13 +1209,20 @@ app.get('/api/news-id', async (req, res) => {
     const attrs = normalizeFields(fields);
 
     const { Op } = require('sequelize');
-    const where = { language: 'id' };
+
+    // ⬇️ cutoff 3 bulan ke belakang
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - 3);
+
+    // ⬇️ filter language + published_at >= cutoff
+    const where = { language: 'id', published_at: { [Op.gte]: cutoff } };
+
     if (category !== 'all') where.category = { [Op.like]: `%${category}%` };
     if (search) {
       where[Op.or] = [
-        { title: { [Op.like]: `%${search}%` } },
+        { title:   { [Op.like]: `%${search}%` } },
         { summary: { [Op.like]: `%${search}%` } },
-        { detail: { [Op.like]: `%${search}%` } },
+        { detail:  { [Op.like]: `%${search}%` } },
       ];
     }
 
@@ -1231,24 +1243,21 @@ app.get('/api/news-id', async (req, res) => {
       offset: (p - 1) * l,
     });
 
-const data = rows.map(r => {
-  const row = r.toJSON ? r.toJSON() : r;
-  if (!row.author_name) row.author_name = toAuthorName(row.author) || null; // ← cek null/empty, bukan "in"
-  return row;
-});
+    const data = rows.map(r => {
+      const row = r.toJSON ? r.toJSON() : r;
+      if (!row.author_name) row.author_name = toAuthorName(row.author) || null;
+      return row;
+    });
 
-
-
-
-const payload = { status: 'success', page: p, perPage: l, total: count, data };
+    const payload = { status: 'success', page: p, perPage: l, total: count, data };
     await redis.set(cacheKey, JSON.stringify(payload), 'EX', 45);
-
     return sendWithETag(req, res, payload, 30);
   } catch (err) {
     console.error('❌ /api/news-id error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // ===== NEWS DETAIL by ID =====
 app.get('/api/news/:id', async (req, res) => {
