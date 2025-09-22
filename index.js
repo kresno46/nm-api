@@ -775,7 +775,8 @@ async function fillAuthorFromIDIfMissing(data) {
 // segera jalan sekali saat boot (dengan lock)
 withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
 withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
-// withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
+withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
+scrapeCalendar();
 
 // interval
 setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 10 * 60 * 1000);
@@ -1175,3 +1176,4 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
