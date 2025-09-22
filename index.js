@@ -1130,8 +1130,8 @@ async function fillAuthorFromIDIfMissing(data) {
 // ===== Schedulers (pakai lock) =====
 withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
 withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
-// scrapeCalendar();
-// withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
+scrapeCalendar();
+withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
 
 // setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData()), 4 * 60 * 60 * 1000); // tiap 4 jam
 setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 10 * 60 * 1000); // 10 menit
@@ -1578,4 +1578,5 @@ app.get('/api/status', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server ready at http://localhost:${PORT}`);
+
 });
