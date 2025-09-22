@@ -18,11 +18,71 @@ const { XMLParser } = require('fast-xml-parser');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ------------------------------ hardening ------------------------------ */
-app.set('trust proxy', true); // aman di Railway/Proxy apa pun
+// ============================ Firebase Admin (FCM) ============================
+const admin = require('firebase-admin');
+
+function getServiceAccountFromEnv() {
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+  if (!b64) throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_BASE64');
+  return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+}
+if (!admin.apps.length) {
+  admin.initializeApp({ credential: admin.credential.cert(getServiceAccountFromEnv()) });
+}
+const fcm = admin.messaging();
+
+// map kategori → topic (ubah sesuai taksonomi kamu)
+function topicFor(category = '') {
+  const c = (category || '').toLowerCase();
+  if (c.includes('commodity')) return 'news_commodity';
+  if (c.includes('currenc'))  return 'news_currencies';
+  if (c.includes('index'))    return 'news_index';
+  if (c.includes('crypto'))   return 'news_crypto';
+  if (c.includes('economy') || c.includes('fiscal')) return 'news_economy';
+  if (c.includes('analysis')) return 'news_analysis';
+  return 'news_all';
+}
+
+// dedupe push dgn redis (3 hari)
+async function alreadyPushed(redis, key) {
+  const k = `push:sent:${key}`;
+  const ok = await redis.set(k, '1', 'NX', 'EX', 60 * 60 * 24 * 3);
+  return ok === null; // true artinya SUDAH ada
+}
+
+async function pushNews({ id, title, summary, image, category }) {
+  const topic = topicFor(category);
+  const deeplink = `newsmaker23://news?id=${id}`;
+  const collapseKey = `news_${id}`;
+  const msg = {
+    topic,
+    notification: {
+      title: String(title || '').slice(0, 110),
+      body: String(summary || 'Tap to read more').slice(0, 230),
+      image: image || undefined,
+    },
+    data: {
+      news_id: String(id),
+      url: deeplink,
+      category: String(category || ''),
+      click_action: 'FLUTTER_NOTIFICATION_CLICK',
+    },
+    android: {
+      notification: { channelId: 'high_importance_channel', imageUrl: image || undefined, priority: 'HIGH', defaultSound: true },
+      collapseKey,
+    },
+    apns: { payload: { aps: { sound: 'default' } }, fcmOptions: { imageUrl: image || undefined } },
+  };
+  const res = await fcm.send(msg);
+  console.log('📣 Push sent:', res, '→', topic);
+}
+
+// ================================ hardening ================================
+app.set('trust proxy', true);
 app.use(helmet());
 app.use(cors());
 app.use(compression());
+app.use(express.json());
 
 // rate limit (express-rate-limit v7)
 const limiter = rateLimit({
@@ -30,20 +90,16 @@ const limiter = rateLimit({
   limit: 120,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.ip,           // hormati trust proxy
-  validate: { xForwardedForHeader: false } // cegah error ERL di env tertentu
+  keyGenerator: (req) => req.ip,
+  validate: { xForwardedForHeader: false }
 });
 app.use(limiter);
 
 // global safety nets
-process.on('unhandledRejection', (reason) => {
-  console.error('🧯 Unhandled Rejection:', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('🧯 Uncaught Exception:', err);
-});
+process.on('unhandledRejection', (reason) => console.error('🧯 Unhandled Rejection:', reason));
+process.on('uncaughtException', (err) => console.error('🧯 Uncaught Exception:', err));
 
-/* ------------------------------- caching -------------------------------- */
+// ================================= caching ================================
 let cachedNews = [];
 let cachedNewsID = [];
 let cachedCalendar = [];
@@ -62,7 +118,7 @@ const redis = new Redis(process.env.REDIS_PUBLIC_URL || {
 redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.error('❌ Redis error:', err));
 
-/* --------------------------------- DB ----------------------------------- */
+// ================================== DB ====================================
 (async () => {
   try {
     await sequelize.authenticate();
@@ -81,7 +137,7 @@ redis.on('error', (err) => console.error('❌ Redis error:', err));
   }
 })();
 
-/* ------------------------------- helpers -------------------------------- */
+// ================================ helpers =================================
 const MONTHS_EN = { jan:0,january:0,feb:1,february:1,mar:2,march:2,apr:3,april:3,may:4,jun:5,june:5,jul:6,july:6,aug:7,august:7,sep:8,sept:8,september:8,oct:9,october:9,nov:10,november:10,dec:11,december:11 };
 const MONTHS_ID = { jan:0,januari:0,feb:1,februari:1,mar:2,maret:2,apr:3,april:3,mei:4,jun:5,juni:5,jul:6,juli:6,agu:7,agustus:7,agst:7,sep:8,september:8,okt:9,oktober:9,nov:10,november:10,des:11,desember:11 };
 
@@ -111,10 +167,7 @@ function ensureDate(d) {
   const x = d instanceof Date ? d : new Date(d);
   return Number.isNaN(+x) ? new Date() : x;
 }
-
-function normalizeSpace(s) {
-  return (s || '').replace(/\s+/g, ' ').trim();
-}
+function normalizeSpace(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
 
 const HTML_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -174,7 +227,7 @@ function normalizeFields(fields) {
   return picked.length ? picked : Array.from(NEWS_ALLOWED_FIELDS);
 }
 
-/* --------------------------- author utilities --------------------------- */
+// =========================== author utilities ============================
 const AUTHOR_ALLOW = new Set(['cp','ayu','az','azf','yds','arl','alg','mrv']);
 const AUTHOR_BLACKLIST = new Set([
   'wti','brent','fed','ecb','boj','pboc','fomc','cpi','pmi','gdp','usd','eur','jpy','ppi','nfp','iea','opec','ath','dxy',
@@ -188,7 +241,6 @@ const AUTHOR_BLACKLIST = new Set([
 ]);
 const AUTHOR_ALIASES = { 'cp':'cp','cP':'cp','CP':'cp','ayu':'ayu','ayiu':'ayu','ayi':'ayu','ay':'ayu','ads':'ayu','az':'az','azf':'azf','yds':'yds','arl':'arl','alg':'alg','mrv':'mrv' };
 const AUTHOR_NAME_MAP = { cp:'Broto', ayu:'Ayu', az:'Nova', azf:'Nova', yds:'Yudis', arl:'Arul', alg:'Burhan', mrv:'Marvy' };
-
 function normalizeAuthorInitial(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
@@ -220,7 +272,7 @@ function sanitizeAuthor(raw) {
   return s;
 }
 
-/* ------------------------------- scraping ------------------------------- */
+// ================================ scraping ================================
 const newsCategories = [
   'economic-news/economy',
   'economic-news/fiscal-moneter',
@@ -261,11 +313,7 @@ function extractNewsItem($, el, lang = 'en') {
 
 async function fetchNewsDetailSafe(url, lang = 'en') {
   return retryRequest(async () => {
-    const { data } = await axios.get(url, {
-      timeout: 180000,
-      headers: makeHtmlHeaders(lang),
-      maxRedirects: 3,
-    });
+    const { data } = await axios.get(url, { timeout: 180000, headers: makeHtmlHeaders(lang), maxRedirects: 3 });
     const $ = cheerio.load(data);
     if (isWafOrChallenge($)) {
       console.warn(`🛡️ WAF/Challenge at: ${url}`);
@@ -467,11 +515,7 @@ async function scrapeNewsByLang(lang = 'en') {
     const MAX_DETAIL_CHARS = 500_000;
     const BATCH_SIZE = 150;
 
-    const trimmed = rows.map(r => ({
-      ...r,
-      detail: (r.detail || '').slice(0, MAX_DETAIL_CHARS),
-    }));
-
+    const trimmed = rows.map(r => ({ ...r, detail: (r.detail || '').slice(0, MAX_DETAIL_CHARS) }));
     const safeRows = trimmed.map(r => ({
       ...r,
       published_at: ensureDate(r.published_at),
@@ -482,15 +526,53 @@ async function scrapeNewsByLang(lang = 'en') {
     for (let i = 0; i < safeRows.length; i += BATCH_SIZE) {
       const chunk = safeRows.slice(i, i + BATCH_SIZE);
       try {
-        await News.bulkCreate(chunk, {
-          updateOnDuplicate: UPDATE_COLS,
-          logging: false,
-        });
+        await News.bulkCreate(chunk, { updateOnDuplicate: UPDATE_COLS, logging: false });
+
+        // === Kirim push untuk item BARU (dedupe via redis) ===
+        for (const r of chunk) {
+          try {
+            const key = r.link || `${r.title}:${+ensureDate(r.published_at)}:${r.language}`;
+            if (await alreadyPushed(redis, key)) continue;
+
+            const rowDb = await News.findOne({
+              where: { link: r.link }, attributes: ['id','title','summary','image','category'], logging: false
+            });
+            if (rowDb?.id) {
+              await pushNews({
+                id: rowDb.id,
+                title: rowDb.title || r.title,
+                summary: rowDb.summary || r.summary,
+                image: rowDb.image || r.image,
+                category: rowDb.category || r.category,
+              });
+            }
+          } catch (e) {
+            console.error('⚠️ push after insert failed:', e.message);
+          }
+        }
+
       } catch (e) {
         console.error('❌ bulkCreate failed, fallback per-row:', e.message);
         for (const r of chunk) {
           try {
             await News.bulkCreate([r], { updateOnDuplicate: UPDATE_COLS, logging: false });
+
+            // kirim push per-row juga
+            const key = r.link || `${r.title}:${+ensureDate(r.published_at)}:${r.language}`;
+            if (!(await alreadyPushed(redis, key))) {
+              const rowDb = await News.findOne({
+                where: { link: r.link }, attributes: ['id','title','summary','image','category'], logging:false
+              });
+              if (rowDb?.id) {
+                await pushNews({
+                  id: rowDb.id,
+                  title: rowDb.title || r.title,
+                  summary: rowDb.summary || r.summary,
+                  image: rowDb.image || r.image,
+                  category: rowDb.category || r.category,
+                });
+              }
+            }
           } catch (er) {
             console.error('   ↳ Row failed:', {
               link: r.link,
@@ -503,9 +585,9 @@ async function scrapeNewsByLang(lang = 'en') {
       }
     }
   }
-} // ← penutup function scrapeNewsByLang
+} // end scrapeNewsByLang
 
-/* ----------------------------- calendar job ----------------------------- */
+// ============================== calendar job ==============================
 async function scrapeCalendar() {
   console.log('🗓️ Scraping calendar with Puppeteer...');
   let browser;
@@ -567,7 +649,7 @@ async function scrapeCalendar() {
   }
 }
 
-/* --------------------------- historical scraper ------------------------- */
+// =========================== historical scraper ===========================
 const BASE_URL = 'https://newsmaker.id/index.php/en/historical-data-2';
 const MAX_CONCURRENT_SCRAPES = 10;
 let cachedSymbols = null;
@@ -722,7 +804,7 @@ async function scrapeAllHistoricalData() {
   return true;
 }
 
-/* ----------------------------- author fallback -------------------------- */
+// ============================= author fallback ============================
 async function fillAuthorFromIDIfMissing(data) {
   const row = data.toJSON ? data.toJSON() : { ...data };
   if ((row.language || '').toLowerCase() !== 'en') return row;
@@ -771,19 +853,18 @@ async function fillAuthorFromIDIfMissing(data) {
   return row;
 }
 
-/* ------------------------------ schedulers ------------------------------ */
-// segera jalan sekali saat boot (dengan lock)
+// ============================== schedulers ================================
 withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
 withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
-withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
 scrapeCalendar();
+withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
 
-// interval
+setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData()), 4 * 60 * 60 * 1000);
 setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 10 * 60 * 1000);
 setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 10 * 60 * 1000);
-setInterval(() => withLock('lock:scrapeCalendar', 300, scrapeCalendar), 60 * 60 * 1000);
+setInterval(scrapeCalendar, 60 * 60 * 1000);
 
-/* ---------------------------------- API --------------------------------- */
+// ================================== API ==================================
 // NEWS EN
 app.get('/api/news', async (req, res) => {
   try {
@@ -947,7 +1028,7 @@ app.get('/api/calendar', async (req, res) => {
   }
 });
 
-// Historical API (MySQL direct, varchar date)
+// Historical API
 app.get('/api/historical', async (req, res) => {
   try {
     const { QueryTypes } = require('sequelize');
@@ -992,7 +1073,7 @@ app.get('/api/historical', async (req, res) => {
   }
 });
 
-// Quotes (no persistent cache)
+// Quotes
 app.get('/api/quotes', async (req, res) => {
   try {
     const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIU5+LCOPX5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
@@ -1027,7 +1108,7 @@ app.get('/api/quotes', async (req, res) => {
   }
 });
 
-/* -------------------------------- shorts -------------------------------- */
+// Shorts (YouTube RSS) – dipertahankan
 const ytCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 function ytBuildFeedUrl({ channelId, user, playlistId }) {
   if (channelId) return `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
@@ -1126,7 +1207,7 @@ app.get('/api/shorts', async (req, res) => {
   }
 });
 
-/* -------------------------------- misc API ------------------------------- */
+// =============================== misc API ================================
 app.delete('/api/cache', async (req, res) => {
   try {
     const { pattern } = req.query;
@@ -1160,7 +1241,18 @@ app.get('/healthz', async (req, res) => {
   }
 });
 
-/* ------------------------------ start server ---------------------------- */
+// === Endpoint uji kirim push manual ===
+app.post('/api/test-push', async (req, res) => {
+  try {
+    const { id = 999, title = 'Test Push', summary = 'Halo dari server', image = '', category = 'general' } = req.body || {};
+    await pushNews({ id, title, summary, image, category });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ============================== start server =============================
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server ready at http://0.0.0.0:${PORT}`);
 });
@@ -1176,4 +1268,3 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-
