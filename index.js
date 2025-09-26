@@ -31,8 +31,10 @@ if (!admin.apps.length) {
 }
 const fcm = admin.messaging();
 
-// map kategori → topic (ubah sesuai taksonomi kamu)
-function topicFor(category = '') {
+/** ===================== PUSH TOPIC & DISPATCH (refactor) ===================== */
+
+// base topic tanpa suffix bahasa
+function topicBaseFor(category = '') {
   const c = (category || '').toLowerCase();
   if (c.includes('commodity')) return 'news_commodity';
   if (c.includes('currenc'))  return 'news_currencies';
@@ -43,28 +45,30 @@ function topicFor(category = '') {
   return 'news_all';
 }
 
-// dedupe push dgn redis (3 hari)
-async function alreadyPushed(redis, key) {
-  const k = `push:sent:${key}`;
-  const ok = await redis.set(k, '1', 'NX', 'EX', 60 * 60 * 24 * 3);
-  return ok === null; // true artinya SUDAH ada
+function resolveLang(lang) {
+  const l = (lang || '').toString().toLowerCase();
+  return l === 'id' ? 'id' : 'en';
 }
 
-async function pushNews({ id, title, summary, image, category }) {
-  const topic = topicFor(category);
+async function pushNews({ id, title, summary, image, category, language = 'en' }) {
+  const lang = resolveLang(language);
+  const base = topicBaseFor(category);
+  const topic = `${base}_${lang}`;                // ← topic per-bahasa
   const deeplink = `newsmaker23://news?id=${id}`;
-  const collapseKey = `news_${id}`;
+  const collapseKey = `news_${id}_${lang}`;
+
   const msg = {
     topic,
     notification: {
       title: String(title || '').slice(0, 110),
-      body: String(summary || 'Tap to read more').slice(0, 230),
+      body: String(summary || (lang === 'id' ? 'Ketuk untuk membaca' : 'Tap to read more')).slice(0, 230),
       image: image || undefined,
     },
     data: {
       news_id: String(id),
       url: deeplink,
       category: String(category || ''),
+      language: lang,                               // ← ikut payload
       click_action: 'FLUTTER_NOTIFICATION_CLICK',
     },
     android: {
@@ -73,8 +77,16 @@ async function pushNews({ id, title, summary, image, category }) {
     },
     apns: { payload: { aps: { sound: 'default' } }, fcmOptions: { imageUrl: image || undefined } },
   };
-  const res = await fcm.send(msg);
-  console.log('📣 Push sent:', res, '→', topic);
+
+  const resLang = await fcm.send(msg);
+  console.log('📣 Push sent:', resLang, '→', topic);
+
+  // kompatibilitas (opsional) ke topik lama tanpa suffix
+  if (process.env.FCM_COMPAT_GLOBAL_TOPIC === '1') {
+    const legacyMsg = { ...msg, topic: base };
+    const resLegacy = await fcm.send(legacyMsg);
+    console.log('📣 Push legacy:', resLegacy, '→', base);
+  }
 }
 
 // ================================ hardening ================================
@@ -535,7 +547,9 @@ async function scrapeNewsByLang(lang = 'en') {
             if (await alreadyPushed(redis, key)) continue;
 
             const rowDb = await News.findOne({
-              where: { link: r.link }, attributes: ['id','title','summary','image','category'], logging: false
+              where: { link: r.link },
+              attributes: ['id','title','summary','image','category','language'], // ← language ikut diambil
+              logging: false
             });
             if (rowDb?.id) {
               await pushNews({
@@ -544,6 +558,7 @@ async function scrapeNewsByLang(lang = 'en') {
                 summary: rowDb.summary || r.summary,
                 image: rowDb.image || r.image,
                 category: rowDb.category || r.category,
+                language: rowDb.language || r.language || 'en', // ← kirim sesuai bahasa
               });
             }
           } catch (e) {
@@ -561,7 +576,9 @@ async function scrapeNewsByLang(lang = 'en') {
             const key = r.link || `${r.title}:${+ensureDate(r.published_at)}:${r.language}`;
             if (!(await alreadyPushed(redis, key))) {
               const rowDb = await News.findOne({
-                where: { link: r.link }, attributes: ['id','title','summary','image','category'], logging:false
+                where: { link: r.link },
+                attributes: ['id','title','summary','image','category','language'], // ← language
+                logging:false
               });
               if (rowDb?.id) {
                 await pushNews({
@@ -570,6 +587,7 @@ async function scrapeNewsByLang(lang = 'en') {
                   summary: rowDb.summary || r.summary,
                   image: rowDb.image || r.image,
                   category: rowDb.category || r.category,
+                  language: rowDb.language || r.language || 'en', // ← kirim sesuai bahasa
                 });
               }
             }
@@ -1241,12 +1259,19 @@ app.get('/healthz', async (req, res) => {
   }
 });
 
-// === Endpoint uji kirim push manual ===
+// === Endpoint uji kirim push manual (refactor: dukung language) ===
 app.post('/api/test-push', async (req, res) => {
   try {
-    const { id = 999, title = 'Test Push', summary = 'Halo dari server', image = '', category = 'general' } = req.body || {};
-    await pushNews({ id, title, summary, image, category });
-    res.json({ ok: true });
+    const {
+      id = 999,
+      title = 'Test Push',
+      summary = 'Halo dari server',
+      image = '',
+      category = 'general',
+      language = 'id',
+    } = req.body || {};
+    await pushNews({ id, title, summary, image, category, language });
+    res.json({ ok: true, topic: `${topicBaseFor(category)}_${resolveLang(language)}` });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -1268,3 +1293,10 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+/** ============================ dedupe helper ============================ */
+async function alreadyPushed(redis, key) {
+  const k = `push:sent:${key}`;
+  const ok = await redis.set(k, '1', 'NX', 'EX', 60 * 60 * 24 * 3);
+  return ok === null;
+}
