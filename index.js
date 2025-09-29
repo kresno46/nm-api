@@ -31,9 +31,9 @@ if (!admin.apps.length) {
 }
 const fcm = admin.messaging();
 
-/** ===================== TOPIC MAP & PUSH (per-BAHASA) ===================== */
+/** ===================== PUSH TOPIC & DISPATCH (refactor) ===================== */
 
-// peta kategori -> topic dasar (tanpa suffix bahasa)
+// base topic tanpa suffix bahasa
 function topicBaseFor(category = '') {
   const c = (category || '').toLowerCase();
   if (c.includes('commodity')) return 'news_commodity';
@@ -44,71 +44,48 @@ function topicBaseFor(category = '') {
   if (c.includes('analysis')) return 'news_analysis';
   return 'news_all';
 }
+
 function resolveLang(lang) {
-  const l = String(lang || '').toLowerCase();
-  return l === 'en' ? 'en' : 'id';
+  const l = (lang || '').toString().toLowerCase();
+  return l === 'id' ? 'id' : 'en';
 }
 
-// dedupe push dgn redis (3 hari)
-async function alreadyPushed(redis, key) {
-  const k = `push:sent:${key}`;
-  const ok = await redis.set(k, '1', 'NX', 'EX', 60 * 60 * 24 * 3);
-  return ok === null; // true artinya SUDAH ada
-}
-
-// ⛳️ kirim ke 2 topic: (1) per-bahasa (news_id/news_en) — WAJIB untuk app kamu
-//                        (2) per-kategori+bahasa (news_crypto_id) — OPSIONAL
-async function pushNews({ id, title, summary, image, category, language = 'id' }) {
+async function pushNews({ id, title, summary, image, category, language = 'en' }) {
   const lang = resolveLang(language);
-  const baseTopic = topicBaseFor(category);
-  const topicLangOnly = `news_${lang}`;                // <- app subscribe ke ini
-  const topicCatLang  = `${baseTopic}_${lang}`;        // <- opsional (kalau nanti mau filter per kategori)
-
+  const base = topicBaseFor(category);
+  const topic = `${base}_${lang}`;                // ← topic per-bahasa
   const deeplink = `newsmaker23://news?id=${id}`;
   const collapseKey = `news_${id}_${lang}`;
 
-  const notifBody =
-    String(summary || (lang === 'id' ? 'Ketuk untuk membaca' : 'Tap to read more')).slice(0, 230);
-
-  const commonMsg = {
+  const msg = {
+    topic,
     notification: {
       title: String(title || '').slice(0, 110),
-      body: notifBody,
+      body: String(summary || (lang === 'id' ? 'Ketuk untuk membaca' : 'Tap to read more')).slice(0, 230),
       image: image || undefined,
     },
     data: {
       news_id: String(id),
       url: deeplink,
       category: String(category || ''),
-      language: lang, // ← penting: dipakai app buat buka detail dg bahasa benar
+      language: lang,                               // ← ikut payload
       click_action: 'FLUTTER_NOTIFICATION_CLICK',
     },
     android: {
-      notification: {
-        channelId: 'high_importance_channel',
-        imageUrl: image || undefined,
-        priority: 'HIGH',
-        defaultSound: true
-      },
+      notification: { channelId: 'high_importance_channel', imageUrl: image || undefined, priority: 'HIGH', defaultSound: true },
       collapseKey,
     },
     apns: { payload: { aps: { sound: 'default' } }, fcmOptions: { imageUrl: image || undefined } },
   };
 
-  // 1) broadcast ke topic per-bahasa (WAJIB)
-  const resLang = await fcm.send({ topic: topicLangOnly, ...commonMsg });
-  console.log('📣 Push sent:', resLang, '→', topicLangOnly);
+  const resLang = await fcm.send(msg);
+  console.log('📣 Push sent:', resLang, '→', topic);
 
-  // 2) kompatibel/opsional ke topic kategori+bahasa
-  if (process.env.FCM_TOPIC_CATEGORY_LANG === '1') {
-    const resCatLang = await fcm.send({ topic: topicCatLang, ...commonMsg });
-    console.log('📣 Push sent:', resCatLang, '→', topicCatLang);
-  }
-
-  // 3) masa transisi ke topic lama tanpa bahasa (opsional)
+  // kompatibilitas (opsional) ke topik lama tanpa suffix
   if (process.env.FCM_COMPAT_GLOBAL_TOPIC === '1') {
-    const legacy = await fcm.send({ topic: baseTopic, ...commonMsg });
-    console.log('📣 Push legacy:', legacy, '→', baseTopic);
+    const legacyMsg = { ...msg, topic: base };
+    const resLegacy = await fcm.send(legacyMsg);
+    console.log('📣 Push legacy:', resLegacy, '→', base);
   }
 }
 
@@ -393,7 +370,7 @@ async function fetchNewsDetailSafe(url, lang = 'en') {
 
     const paragraphs = [];
     $article.find('p').each((_, p) => {
-      const txt = normalizeSpace($(p).text()));
+      const txt = normalizeSpace($(p).text());
       if (txt) paragraphs.push(txt);
     });
     const plainText = paragraphs.join('\n\n');
@@ -581,7 +558,7 @@ async function scrapeNewsByLang(lang = 'en') {
                 summary: rowDb.summary || r.summary,
                 image: rowDb.image || r.image,
                 category: rowDb.category || r.category,
-                language: rowDb.language || r.language || lang, // ← penting
+                language: rowDb.language || r.language || 'en', // ← kirim sesuai bahasa
               });
             }
           } catch (e) {
@@ -595,11 +572,12 @@ async function scrapeNewsByLang(lang = 'en') {
           try {
             await News.bulkCreate([r], { updateOnDuplicate: UPDATE_COLS, logging: false });
 
+            // kirim push per-row juga
             const key = r.link || `${r.title}:${+ensureDate(r.published_at)}:${r.language}`;
             if (!(await alreadyPushed(redis, key))) {
               const rowDb = await News.findOne({
                 where: { link: r.link },
-                attributes: ['id','title','summary','image','category','language'],
+                attributes: ['id','title','summary','image','category','language'], // ← language
                 logging:false
               });
               if (rowDb?.id) {
@@ -609,7 +587,7 @@ async function scrapeNewsByLang(lang = 'en') {
                   summary: rowDb.summary || r.summary,
                   image: rowDb.image || r.image,
                   category: rowDb.category || r.category,
-                  language: rowDb.language || r.language || lang,
+                  language: rowDb.language || r.language || 'en', // ← kirim sesuai bahasa
                 });
               }
             }
@@ -1281,7 +1259,7 @@ app.get('/healthz', async (req, res) => {
   }
 });
 
-// === Endpoint uji kirim push manual (sekarang dukung language) ===
+// === Endpoint uji kirim push manual (refactor: dukung language) ===
 app.post('/api/test-push', async (req, res) => {
   try {
     const {
@@ -1293,7 +1271,7 @@ app.post('/api/test-push', async (req, res) => {
       language = 'id',
     } = req.body || {};
     await pushNews({ id, title, summary, image, category, language });
-    res.json({ ok: true, topics: [`news_${resolveLang(language)}`, `${topicBaseFor(category)}_${resolveLang(language)}`] });
+    res.json({ ok: true, topic: `${topicBaseFor(category)}_${resolveLang(language)}` });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -1315,3 +1293,11 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+/** ============================ dedupe helper ============================ */
+async function alreadyPushed(redis, key) {
+  const k = `push:sent:${key}`;
+  const ok = await redis.set(k, '1', 'NX', 'EX', 60 * 60 * 24 * 3);
+  return ok === null;
+}
+
