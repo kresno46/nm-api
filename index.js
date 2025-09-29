@@ -262,6 +262,52 @@ function normalizeFields(fields) {
   return picked.length ? picked : Array.from(NEWS_ALLOWED_FIELDS);
 }
 
+// ---- text sanitizers ----
+function decodeUnicodeEscapes(s) {
+  return String(s || '')
+    // unicode escapes commonly produced by some serializers
+    .replace(/\u003E/g, '>')
+    .replace(/\u003C/g, '<')
+    .replace(/\u0026/g, '&')
+    .replace(/\u00a0/g, ' ')
+    // html entities
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&gt;/gi, '>')
+    .replace(/&lt;/gi, '<')
+    .replace(/&amp;/gi, '&')
+    // collapse spaces
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function deepCleanCalendar(obj) {
+  if (obj == null) return obj;
+  if (typeof obj === 'string') return decodeUnicodeEscapes(obj);
+  if (Array.isArray(obj)) {
+    return obj
+      .map(deepCleanCalendar)
+      .filter((x) => x != null && (typeof x !== 'object' || Object.keys(x).length > 0));
+  }
+  if (typeof obj === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) out[k] = deepCleanCalendar(v);
+
+    // bersihkan history header rows
+    if (Array.isArray(out.history)) {
+      out.history = out.history.filter((row) => {
+        const d = String(row?.date || '').toLowerCase();
+        if (!d) return false;
+        if (d === 'history' || d === 'date') return false;
+        return /[0-9]/.test(d);
+      });
+    }
+    return out;
+  }
+  return obj;
+}
+
+
+
 // =========================== author utilities ============================
 const AUTHOR_ALLOW = new Set(['cp','ayu','az','azf','yds','arl','alg','mrv']);
 const AUTHOR_BLACKLIST = new Set([
@@ -628,66 +674,258 @@ async function scrapeNewsByLang(lang = 'en') {
 } // end scrapeNewsByLang
 
 // ============================== calendar job ==============================
-async function scrapeCalendar() {
-  console.log('🗓️ Scraping calendar with Puppeteer...');
+// ====== Calendar URL mapping (fixed) ======
+const CAL_URLS = {
+  today: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar',
+  this:  'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=r&limitstart=0',
+  prev:  'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=p&limitstart=0',
+  next:  'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=n&limitstart=0',
+};
+
+// ====== Redis key helper ======
+const calKey = (t) => `calendar:${t}`;
+
+// ====== In-memory cache (opsional) ======
+let calendarCache = {
+  today: { updatedAt: null, data: [] },
+  this:  { updatedAt: null, data: [] },
+  prev:  { updatedAt: null, data: [] },
+  next:  { updatedAt: null, data: [] },
+};
+
+const CAL_TTL_SECONDS = 60 * 15; // 15 menit
+
+// ——— Core scraper dengan pagination ———
+async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = {}) {
+  console.log(`🗓️ Scraping (paged): ${startUrl}`);
   let browser;
+  const all = [];
+
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox'] });
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36');
-    await page.goto('https://www.newsmaker.id/index.php/en/analysis/economic-calendar', { waitUntil: 'networkidle2', timeout: 60000 });
-    await page.waitForSelector('table');
-
-    const eventsData = await page.evaluate(() => {
-      const rows = Array.from(document.querySelectorAll('table tbody tr'));
-      const results = [];
-      for (let i = 0; i < rows.length; i++) {
-        const tds = rows[i].querySelectorAll('td');
-        if (tds.length < 4) continue;
-        const time = tds[0].innerText.trim();
-        const currency = tds[1].innerText.trim();
-        const impactSpan = tds[2].querySelector('span');
-        const impact = impactSpan ? impactSpan.innerText.trim() : null;
-        const raw = tds[3].innerText.trim();
-        if (!time || !currency || !impact || !raw || raw === '-' || currency === '-' || raw.includes('2025-')) continue;
-
-        const [eventLine, figuresLine] = raw.split('\n');
-        const event = eventLine?.trim() || null;
-        let previous = null, forecast = null, actual = null;
-        if (figuresLine) {
-          const prevMatch = figuresLine.match(/Previous:\s*([^|]*)/);
-          const foreMatch = figuresLine.match(/Forecast:\s*([^|]*)/);
-          const actMatch = figuresLine.match(/Actual:\s*([^|]*)/);
-          previous = prevMatch ? prevMatch[1].trim() : '-';
-          forecast = foreMatch ? foreMatch[1].trim() : '-';
-          actual = actMatch ? actMatch[1].trim() : '-';
-        }
-        results.push({ time, currency, impact, event, previous, forecast, actual });
-      }
-      return results;
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+      ],
     });
+    const page = await browser.newPage();
 
-    cachedCalendar = eventsData;
-    lastUpdatedCalendar = new Date();
-    await browser.close();
-    console.log(`✅ Calendar updated (${cachedCalendar.length} events)`);
+    // stealth ringan
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      window.chrome = { runtime: {} };
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+    });
+    await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    try {
-      await redis.set('calendar:all', JSON.stringify({
-        status: 'success',
-        updatedAt: lastUpdatedCalendar,
-        total: cachedCalendar.length,
-        data: cachedCalendar,
-      }), 'EX', 60 * 15);
-      console.log('💾 Calendar cached in Redis (15m)');
-    } catch (err) {
-      console.error('❌ Redis save calendar:', err.message);
+    // helper bikin URL page ke-N sesuai pola situs (?start=offset)
+    const makePagedUrl = (u, offset) => {
+      const urlObj = new URL(u);
+      urlObj.searchParams.delete('limitstart'); // buang param lama kalau ada
+      if (offset > 0) urlObj.searchParams.set('start', String(offset));
+      else urlObj.searchParams.delete('start');
+      return urlObj.toString();
+    };
+
+    for (let p = 1, offset = 0; p <= maxPages; p++, offset += pageSize) {
+      const url = (p === 1 ? startUrl : makePagedUrl(startUrl, offset));
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+
+      // kalau tabel kosong, biarkan lanjut break di bawah
+      await page.waitForSelector('table tbody', { timeout: 60000 });
+      await page.waitForFunction(
+        () => document.querySelectorAll('table tbody tr').length >= 0,
+        { timeout: 15000 }
+      ).catch(() => {});
+
+      const res = await page.evaluate(() => {
+        const norm = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
+
+        function findMainTable() {
+          const tables = Array.from(document.querySelectorAll('table'));
+          for (const tb of tables) {
+            const ths = Array.from(tb.querySelectorAll('thead th')).map(th => norm(th.textContent).toLowerCase());
+            const ok = ths.includes('time') && ths.includes('country') && ths.includes('impact') && ths.some(t => t.includes('figure'));
+            if (ok && tb.tBodies && tb.tBodies.length > 0) return tb;
+          }
+          // fallback: null (biar dianggap 0 items)
+          return null;
+        }
+
+        const main = findMainTable();
+        if (!main) return { items: [], kept: 0 };
+
+        const tbody = main.tBodies[0];
+        const rows = Array.from(tbody.rows); // hanya TR langsung
+        const out = [];
+        let lastEvent = null;
+
+        for (const tr of rows) {
+          const tds = tr.cells;
+
+          // — detail row (accordion / colspan) —
+          const isDetailRow = tds.length === 1 || Array.from(tds).some(td => (td.colSpan || 1) > 1);
+          if (isDetailRow) {
+            if (!lastEvent) continue;
+            const wrap = tr.querySelector('.accordion-collapse') || tr;
+            const box  = wrap.querySelector('.box-cal-detail') || wrap;
+
+            const sections = Array.from(box.querySelectorAll('.mb-3'));
+            const details = {};
+            for (const sec of sections) {
+              const h = sec.querySelector('h5');
+              const title = norm(h?.textContent || '').toLowerCase();
+              const text  = norm(sec.textContent.replace(h?.textContent || '', ''));
+              if (!title) continue;
+              if (title.includes('sources')) details.sources = text;
+              else if (title.includes('measures')) details.measures = text;
+              else if (title.includes('usual effect')) details.usualEffect = text;
+              else if (title.includes('frequency')) details.frequency = text;
+              else if (title.includes('next released')) details.nextReleased = text;
+              else if (title.includes('notes')) details.notes = text;
+              else if (title.includes('why trader care')) details.whyTraderCare = text;
+            }
+
+            // table history (skip baris header)
+            const histTable = wrap.querySelector('table');
+            if (histTable) {
+              const histRows = Array.from(histTable.querySelectorAll('tbody tr'));
+              details.history = histRows.map(r => {
+                const cs = r.cells;
+                const d0 = norm(cs[0]?.textContent || '');
+                if (/^(history|date)$/i.test(d0)) return null;
+                return {
+                  date:     d0,
+                  previous: norm(cs[1]?.textContent || ''),
+                  forecast: norm(cs[2]?.textContent || ''),
+                  actual:   norm(cs[3]?.textContent || ''),
+                };
+              }).filter(x => x && x.date && /[0-9]/.test(x.date));
+            }
+
+            lastEvent.details = details;
+            continue;
+          }
+
+          // — main row —
+          if (tds.length >= 4) {
+            const time = norm(tds[0]?.innerText || '-') || '-';
+            const currency = norm(tds[1]?.innerText || '-') || '-';
+            const impactCell = tds[2];
+            let impact =
+              norm(impactCell?.innerText || '') ||
+              impactCell?.getAttribute?.('title') ||
+              impactCell?.querySelector?.('[title]')?.getAttribute('title') ||
+              impactCell?.querySelector?.('img')?.getAttribute('alt') ||
+              '-';
+            impact = norm(impact);
+
+            const figuresTd = tds[3];
+            const raw = norm(figuresTd?.innerText || '');
+            if (!raw || raw === '-') continue;
+
+            const [eventLine, figuresLine] = (figuresTd?.innerText || '').split('\n');
+            const event = norm(eventLine);
+            if (!event) continue;
+
+            let previous = '-', forecast = '-', actual = '-';
+            if (figuresLine) {
+              const prevMatch = figuresLine.match(/Previous:\s*([^|]*)/i);
+              const foreMatch = figuresLine.match(/Forecast:\s*([^|]*)/i);
+              const actMatch  = figuresLine.match(/Actual:\s*([^|]*)/i);
+              previous = prevMatch ? norm(prevMatch[1]) : '-';
+              forecast = foreMatch ? norm(foreMatch[1]) : '-';
+              actual   = actMatch  ? norm(actMatch[1])  : '-';
+            }
+
+            const obj = { time, currency, impact, event, previous, forecast, actual };
+            out.push(obj);
+            lastEvent = obj;
+          }
+        }
+
+        return { items: out, kept: out.length };
+      });
+
+      console.log(`📄 Page offset=${(p-1)*pageSize}: +${res.kept} (total ${all.length + res.kept})`);
+      if (res.kept === 0) break;          // halaman kosong → selesai
+      all.push(...res.items);
+      if (res.kept < pageSize) break;     // halaman terakhir (< 20 item) → selesai
     }
+
+    await browser.close();
+    return { ok: true, data: all, error: null };
   } catch (err) {
-    if (browser) await browser.close();
-    console.error('❌ Calendar scraping failed:', err.message);
+    if (browser) try { await browser.close(); } catch {}
+    console.error('❌ scrapeCalendarPaged failed:', err.message);
+    return { ok: false, data: [], error: err.message };
   }
 }
+
+// ——— Wrapper per-tab (today/this/prev/next) + cleaning & Redis ———
+async function scrapeCalendarToday() {
+  const result = await scrapeCalendarPaged(CAL_URLS.today, { maxPages: 1 });
+  if (!result.ok) throw new Error(result.error || 'Scrape today failed');
+  const updatedAt = new Date();
+  const cleaned = deepCleanCalendar(result.data);
+  calendarCache.today = { updatedAt, data: cleaned };
+  await redis.set(
+    calKey('today'),
+    JSON.stringify({ status: 'success', updatedAt, total: cleaned.length, data: cleaned }),
+    'EX', CAL_TTL_SECONDS
+  );
+  console.log(`✅ Calendar TODAY updated (${cleaned.length} events)`);
+  return calendarCache.today;
+}
+
+async function scrapeCalendarThisWeek() {
+  const result = await scrapeCalendarPaged(CAL_URLS.this, { maxPages: 20, pageSize: 20 });
+  if (!result.ok) throw new Error(result.error || 'Scrape this week failed');
+  const updatedAt = new Date();
+  const cleaned = deepCleanCalendar(result.data);
+  calendarCache.this = { updatedAt, data: cleaned };
+  await redis.set(calKey('this'),
+    JSON.stringify({ status:'success', updatedAt, total: cleaned.length, data: cleaned }),
+    'EX', CAL_TTL_SECONDS
+  );
+  console.log(`✅ Calendar THIS WEEK updated (${cleaned.length} events)`);
+  return calendarCache.this;
+}
+
+async function scrapeCalendarPrevWeek() {
+  const result = await scrapeCalendarPaged(CAL_URLS.prev, { maxPages: 20, pageSize: 20 });
+  if (!result.ok) throw new Error(result.error || 'Scrape prev week failed');
+  const updatedAt = new Date();
+  const cleaned = deepCleanCalendar(result.data);
+  calendarCache.prev = { updatedAt, data: cleaned };
+  await redis.set(calKey('prev'),
+    JSON.stringify({ status:'success', updatedAt, total: cleaned.length, data: cleaned }),
+    'EX', CAL_TTL_SECONDS
+  );
+  console.log(`✅ Calendar PREVIOUS WEEK updated (${cleaned.length} events)`);
+  return calendarCache.prev;
+}
+
+async function scrapeCalendarNextWeek() {
+  const result = await scrapeCalendarPaged(CAL_URLS.next, { maxPages: 20, pageSize: 20 });
+  if (!result.ok) throw new Error(result.error || 'Scrape next week failed');
+  const updatedAt = new Date();
+  const cleaned = deepCleanCalendar(result.data);
+  calendarCache.next = { updatedAt, data: cleaned };
+  await redis.set(calKey('next'),
+    JSON.stringify({ status:'success', updatedAt, total: cleaned.length, data: cleaned }),
+    'EX', CAL_TTL_SECONDS
+  );
+  console.log(`✅ Calendar NEXT WEEK updated (${cleaned.length} events)`);
+  return calendarCache.next;
+}
+
+
+
 
 // =========================== historical scraper ===========================
 const BASE_URL = 'https://newsmaker.id/index.php/en/historical-data-2';
@@ -893,16 +1131,58 @@ async function fillAuthorFromIDIfMissing(data) {
   return row;
 }
 
+// Jalankan sekali saat boot (one-off)
+(async () => {
+  try {
+    await scrapeCalendarToday();
+    await scrapeCalendarThisWeek();
+    await scrapeCalendarPrevWeek();
+    await scrapeCalendarNextWeek();
+    console.log('✅ Pre-warm calendar done');
+  } catch (e) {
+    console.error('❌ Pre-warm error:', e.message);
+  }
+})();
+
+// ====== OPTIONAL: helper lock biar nggak dobel ======
+async function withLock(key, ttlSeconds, fn) {
+  const token = `${Date.now()}-${Math.random()}`;
+  const ok = await redis.set(key, token, 'NX', 'EX', ttlSeconds);
+  if (!ok) return; // sudah ada yang jalan
+  try { await fn(); } finally {
+    const v = await redis.get(key);
+    if (v === token) await redis.del(key);
+  }
+}
+
+// ====== SCHEDULERS ======
+if (!global.__CAL_SCHEDULER__) {
+  global.__CAL_SCHEDULER__ = true;
+
+  // boot: stagger 10s antar job supaya Puppeteer nggak tabrakan
+  withLock('lock:cal:today', 120, scrapeCalendarToday);
+  setTimeout(() => withLock('lock:cal:this', 120, scrapeCalendarThisWeek), 10_000);
+  setTimeout(() => withLock('lock:cal:prev', 120, scrapeCalendarPrevWeek), 20_000);
+  setTimeout(() => withLock('lock:cal:next', 120, scrapeCalendarNextWeek), 30_000);
+
+  // interval: setiap 15 menit, di-stagger juga
+  setInterval(() => withLock('lock:cal:today', 120, scrapeCalendarToday), 15 * 60 * 1000);
+  setInterval(() => withLock('lock:cal:this', 120, scrapeCalendarThisWeek), 15 * 60 * 1000 + 10_000);
+  setInterval(() => withLock('lock:cal:prev', 120, scrapeCalendarPrevWeek), 15 * 60 * 1000 + 20_000);
+  setInterval(() => withLock('lock:cal:next', 120, scrapeCalendarNextWeek), 15 * 60 * 1000 + 30_000);
+}
+
+
 // ============================== schedulers ================================
 withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
 withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
-scrapeCalendar();
+// scrapeCalendar();
 withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
 
 setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData()), 4 * 60 * 60 * 1000);
-setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 10 * 60 * 1000);
-setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 10 * 60 * 1000);
-setInterval(scrapeCalendar, 60 * 60 * 1000);
+setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 5 * 60 * 1000);
+setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 5 * 60 * 1000);
+// setInterval(scrapeCalendar, 15 * 60 * 1000);
 
 // ================================== API ==================================
 // NEWS EN
@@ -1049,24 +1329,135 @@ app.get('/api/news-id/:id', async (req, res) => {
 });
 
 // Calendar API
-app.get('/api/calendar', async (req, res) => {
+// ===== TODAY =====
+// TODAY
+app.get('/api/calendar/today', async (req, res) => {
   try {
-    const cached = await redis.get('calendar:all');
-    if (cached) return res.json(JSON.parse(cached));
-    await scrapeCalendar();
-    const freshData = {
-      status: 'success',
-      updatedAt: lastUpdatedCalendar,
-      total: cachedCalendar.length,
-      data: cachedCalendar,
-    };
-    await redis.set('calendar:all', JSON.stringify(freshData), 'EX', 60 * 60);
-    res.json(freshData);
+    const cached = await redis.get(calKey('today'));
+    if (cached) {
+      const payload = JSON.parse(cached);
+      payload.data = deepCleanCalendar(payload.data);
+      payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
+      return res.json(payload);
+    }
+    const { updatedAt, data } = await scrapeCalendarToday();
+    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('today'), JSON.stringify(payload), 'EX', 60*60);
+    res.json(payload);
   } catch (err) {
-    console.error('❌ /api/calendar error:', err.message);
+    console.error('❌ /api/calendar/today error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
+// ===== THIS WEEK =====
+app.get('/api/calendar/this-week', async (req, res) => {
+  try {
+    const cached = await redis.get(calKey('this'));
+    if (cached) {
+      const payload = JSON.parse(cached);
+      payload.data = deepCleanCalendar(payload.data);
+      payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
+      return res.json(payload);
+    }
+    const { updatedAt, data } = await scrapeCalendarThisWeek();
+    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('this'), JSON.stringify(payload), 'EX', 60*60);
+    res.json(payload);
+  } catch (err) {
+    console.error('❌ /api/calendar/this-week error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ===== PREVIOUS WEEK =====
+app.get('/api/calendar/previous-week', async (req, res) => {
+  try {
+    const cached = await redis.get(calKey('prev'));
+    if (cached) {
+      const payload = JSON.parse(cached);
+      payload.data = deepCleanCalendar(payload.data);
+      payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
+      return res.json(payload);
+    }
+    const { updatedAt, data } = await scrapeCalendarPrevWeek();
+    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('prev'), JSON.stringify(payload), 'EX', 60*60);
+    res.json(payload);
+  } catch (err) {
+    console.error('❌ /api/calendar/previous-week error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ===== NEXT WEEK =====
+app.get('/api/calendar/next-week', async (req, res) => {
+  try {
+    const cached = await redis.get(calKey('next'));
+    if (cached) {
+      const payload = JSON.parse(cached);
+      payload.data = deepCleanCalendar(payload.data);
+      payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
+      return res.json(payload);
+    }
+    const { updatedAt, data } = await scrapeCalendarNextWeek();
+    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('next'), JSON.stringify(payload), 'EX', 60*60);
+    res.json(payload);
+  } catch (err) {
+    console.error('❌ /api/calendar/next-week error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ===== (Optional) Legacy param ?t=... agar kompatibel =====
+app.get('/api/calendar', async (req, res) => {
+  try {
+    const tParam = (req.query.t || 'today').toString().toLowerCase();
+    if (tParam === 'today') return res.redirect(307, '/api/calendar/today');
+    if (tParam === 'this')  return res.redirect(307, '/api/calendar/this-week');
+    if (tParam === 'prev')  return res.redirect(307, '/api/calendar/previous-week');
+    if (tParam === 'next')  return res.redirect(307, '/api/calendar/next-week');
+    return res.redirect(307, '/api/calendar/today');
+  } catch (err) {
+    console.error('❌ /api/calendar (legacy) error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/calendar/all', async (req, res) => {
+  try {
+    const keys = ['today','this','prev','next'];
+    const cached = await Promise.all(keys.map(k => redis.get(calKey(k))));
+    const result = {};
+    const toFetch = [];
+
+    keys.forEach((k, i) => {
+      if (cached[i]) result[k] = JSON.parse(cached[i]);
+      else toFetch.push(k);
+    });
+
+    // scrape yang belum ada
+    for (const k of toFetch) {
+      let dataPack;
+      if (k === 'today') dataPack = await scrapeCalendarToday();
+      else if (k === 'this') dataPack = await scrapeCalendarThisWeek();
+      else if (k === 'prev') dataPack = await scrapeCalendarPrevWeek();
+      else if (k === 'next') dataPack = await scrapeCalendarNextWeek();
+
+      result[k] = { status:'success', updatedAt: dataPack.updatedAt, total: dataPack.data.length, data: dataPack.data };
+      await redis.set(calKey(k), JSON.stringify(result[k]), 'EX', 60*60);
+    }
+
+    res.json({ status:'success', ...result });
+  } catch (err) {
+    console.error('❌ /api/calendar/all error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
 
 // Historical API
 app.get('/api/historical', async (req, res) => {
