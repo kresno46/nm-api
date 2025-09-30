@@ -790,128 +790,164 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
           { timeout: 15000 }
         ).catch(() => { });
 
-        const res = await page.evaluate(() => {
-          const norm = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
+const res = await page.evaluate(() => {
+  const norm = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
 
-          function findMainTable() {
-            const tables = Array.from(document.querySelectorAll('table'));
-            for (const tb of tables) {
-              const ths = Array.from(tb.querySelectorAll('thead th')).map(th => norm(th.textContent).toLowerCase());
-              const ok = ths.includes('time') && ths.some(t => t.includes('country')) && ths.includes('impact') && ths.some(t => t.includes('figure'));
-              if (ok && tb.tBodies && tb.tBodies.length > 0) return tb;
-            }
-            return null;
-          }
+  // Ubah "DD-MM-YYYY" → "YYYY-MM-DD" (kalau sudah YYYY-MM-DD biarkan)
+  const fmtDate = (d) => {
+    const s = norm(d);
+    let m = s.match(/^(\d{2})[-\/](\d{2})[-\/](\d{4})$/);     // DD-MM-YYYY
+    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+    m = s.match(/^(\d{4})[-\/](\d{2})[-\/](\d{2})$/);          // YYYY-MM-DD
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+    return s; // fallback
+  };
 
-          const main = findMainTable();
-          if (!main) return { items: [], kept: 0 };
+  // Deteksi teks tanggal
+  const isDateText = (txt) =>
+    /^\d{2}[-/]\d{2}[-/]\d{4}$/.test(txt) || /^\d{4}-\d{2}-\d{2}$/.test(txt);
 
-          const tbody = main.tBodies[0];
-          const rows = Array.from(tbody.rows);
-          const out = [];
-          let lastEvent = null;
+  // Cari tabel utama kalender
+  function findMainTable() {
+    const tables = Array.from(document.querySelectorAll('table'));
+    for (const tb of tables) {
+      const ths = Array.from(tb.querySelectorAll('thead th'))
+        .map((th) => norm(th.textContent).toLowerCase());
+      const ok =
+        ths.includes('time') &&
+        ths.includes('country') &&
+        ths.includes('impact') &&
+        ths.some((t) => t.includes('figure'));
+      if (ok && tb.tBodies && tb.tBodies.length > 0) return tb;
+    }
+    return null;
+  }
 
-          const isDateText = (txt) =>
-            /^\d{2}[-/]\d{2}[-/]\d{4}$/.test(txt) || /^\d{4}-\d{2}-\d{2}$/.test(txt);
+  const main = findMainTable();
+  if (!main) return { items: [], kept: 0 };
 
-          for (const tr of rows) {
-            const tds = tr.cells;
+  const tbody = main.tBodies[0];
+  const rows = Array.from(tbody.rows);
+  const out = [];
+  let lastEvent = null;
 
-            // detail row (accordion)
-            const isDetailRow = tds.length === 1 || Array.from(tds).some(td => (td.colSpan || 1) > 1);
-            if (isDetailRow) {
-              if (!lastEvent) continue;
-              const wrap = tr.querySelector('.accordion-collapse') || tr;
-              const box = wrap.querySelector('.box-cal-detail') || wrap;
+  for (const tr of rows) {
+    const tds = tr.cells;
 
-              const sections = Array.from(box.querySelectorAll('.mb-3'));
-              const details = {};
-              for (const sec of sections) {
-                const h = sec.querySelector('h5');
-                const title = norm(h?.textContent || '').toLowerCase();
-                const text = norm(sec.textContent.replace(h?.textContent || '', ''));
-                if (!title) continue;
-                if (title.includes('sources')) details.sources = text;
-                else if (title.includes('measures')) details.measures = text;
-                else if (title.includes('usual effect')) details.usualEffect = text;
-                else if (title.includes('frequency')) details.frequency = text;
-                else if (title.includes('next released')) details.nextReleased = text;
-                else if (title.includes('notes')) details.notes = text;
-                else if (title.includes('why trader care')) details.whyTraderCare = text;
-              }
+    // ====== ROW DETAIL (accordion) ======
+    const isDetailRow =
+      tds.length === 1 || Array.from(tds).some((td) => (td.colSpan || 1) > 1);
 
-              const histTable = wrap.querySelector('table');
-              if (histTable) {
-                const histRows = Array.from(histTable.querySelectorAll('tbody tr'));
-                details.history = histRows.map(r => {
-                  const cs = r.cells;
-                  const d0 = norm(cs[0]?.textContent || '');
-                  if (/^(history|date)$/i.test(d0)) return null;
-                  return {
-                    date: d0,
-                    previous: norm(cs[1]?.textContent || ''),
-                    forecast: norm(cs[2]?.textContent || ''),
-                    actual: norm(cs[3]?.textContent || ''),
-                  };
-                }).filter(x => x && x.date && /[0-9]/.test(x.date));
-              }
+    if (isDetailRow) {
+      if (!lastEvent) continue;
 
-              lastEvent.details = details;
-              continue;
-            }
+      const wrap = tr.querySelector('.accordion-collapse') || tr;
+      const box = wrap.querySelector('.box-cal-detail') || wrap;
 
-            if (tds.length >= 4) {
-              // --- bedain layout: with/without DATE column di posisi pertama ---
-              const c0 = norm(tds[0]?.innerText || '');
-              const c1 = norm(tds[1]?.innerText || '');
-              const hasDate = isDateText(c0);
+      const sections = Array.from(box.querySelectorAll('.mb-3'));
+      const details = {};
+      for (const sec of sections) {
+        const h = sec.querySelector('h5');
+        const title = norm(h?.textContent || '').toLowerCase();
+        const text = norm(sec.textContent.replace(h?.textContent || '', ''));
+        if (!title) continue;
+        if (title.includes('sources')) details.sources = text;
+        else if (title.includes('measures')) details.measures = text;
+        else if (title.includes('usual effect')) details.usualEffect = text;
+        else if (title.includes('frequency')) details.frequency = text;
+        else if (title.includes('next released')) details.nextReleased = text;
+        else if (title.includes('notes')) details.notes = text;
+        else if (title.includes('why trader care')) details.whyTraderCare = text;
+      }
 
-              const date = hasDate ? c0 : null;
-              const time = hasDate ? (c1 || '-') : (c0 || '-');
+      const histTable = wrap.querySelector('table');
+      if (histTable) {
+        const histRows = Array.from(histTable.querySelectorAll('tbody tr'));
+        details.history = histRows
+          .map((r) => {
+            const cs = r.cells;
+            const d0 = norm(cs[0]?.textContent || '');
+            if (/^(history|date)$/i.test(d0)) return null;
+            return {
+              date: d0,
+              previous: norm(cs[1]?.textContent || ''),
+              forecast: norm(cs[2]?.textContent || ''),
+              actual: norm(cs[3]?.textContent || ''),
+            };
+          })
+          .filter((x) => x && x.date && /[0-9]/.test(x.date));
+      }
 
-              const idxCurrency = hasDate ? 2 : 1;
-              const idxImpact = hasDate ? 3 : 2;
-              const idxFigures = hasDate ? 4 : 3;
+      lastEvent.details = details;
+      continue;
+    }
 
-              const currency = norm(tds[idxCurrency]?.innerText || '-') || '-';
+    // ====== ROW EVENT ======
+    if (tds.length >= 4) {
+      const c0 = norm(tds[0]?.innerText || '');
+      const c1 = norm(tds[1]?.innerText || '');
+      const hasDate = isDateText(c0);
 
-              const impactCell = tds[idxImpact];
-              let impact =
-                norm(impactCell?.innerText || '') ||
-                impactCell?.getAttribute?.('title') ||
-                impactCell?.querySelector?.('[title]')?.getAttribute('title') ||
-                impactCell?.querySelector?.('img')?.getAttribute('alt') ||
-                '-';
-              impact = norm(impact);
+      const dateStr = hasDate ? c0 : null;              // "29-09-2025"
+      const timeOnly = hasDate ? (c1 || '-') : (c0 || '-'); // "14.00" atau "06.50"
 
-              const figuresTd = tds[idxFigures];
-              const raw = norm(figuresTd?.innerText || '');
-              if (!raw || raw === '-') continue;
+      const idxCurrency = hasDate ? 2 : 1;
+      const idxImpact = hasDate ? 3 : 2;
+      const idxFigures = hasDate ? 4 : 3;
 
-              const [eventLine, figuresLine] = (figuresTd?.innerText || '').split('\n');
-              const event = norm(eventLine);
-              if (!event) continue;
+      const currency = norm(tds[idxCurrency]?.innerText || '-') || '-';
 
-              let previous = '-', forecast = '-', actual = '-';
-              if (figuresLine) {
-                const prevMatch = figuresLine.match(/Previous:\s*([^|]*)/i);
-                const foreMatch = figuresLine.match(/Forecast:\s*([^|]*)/i);
-                const actMatch = figuresLine.match(/Actual:\s*([^|]*)/i);
-                previous = prevMatch ? norm(prevMatch[1]) : '-';
-                forecast = foreMatch ? norm(foreMatch[1]) : '-';
-                actual = actMatch ? norm(actMatch[1]) : '-';
-              }
+      const impactCell = tds[idxImpact];
+      let impact =
+        norm(impactCell?.innerText || '') ||
+        impactCell?.getAttribute?.('title') ||
+        impactCell?.querySelector?.('[title]')?.getAttribute('title') ||
+        impactCell?.querySelector?.('img')?.getAttribute('alt') ||
+        '-';
+      impact = norm(impact);
 
-              const obj = { time, currency, impact, event, previous, forecast, actual };
-              if (hasDate) obj.date = date; // ← hanya week pages yang punya date
+      const figuresTd = tds[idxFigures];
+      const raw = norm(figuresTd?.innerText || '');
+      if (!raw || raw === '-') continue;
 
-              out.push(obj);
-              lastEvent = obj;
-            }
-          }
+      const [eventLine, figuresLine] = (figuresTd?.innerText || '').split('\n');
+      const event = norm(eventLine);
+      if (!event) continue;
 
-          return { items: out, kept: out.length };
-        });
+      let previous = '-',
+        forecast = '-',
+        actual = '-';
+      if (figuresLine) {
+        const prevMatch = figuresLine.match(/Previous:\s*([^|]*)/i);
+        const foreMatch = figuresLine.match(/Forecast:\s*([^|]*)/i);
+        const actMatch = figuresLine.match(/Actual:\s*([^|]*)/i);
+        previous = prevMatch ? norm(prevMatch[1]) : '-';
+        forecast = foreMatch ? norm(foreMatch[1]) : '-';
+        actual = actMatch ? norm(actMatch[1]) : '-';
+      }
+
+      // KUNCI: untuk week tabs, kolom time = "YYYY-MM-DD HH.mm"; untuk today tetap "HH.mm"
+      const timeOut = hasDate ? `${fmtDate(dateStr)} ${timeOnly}` : timeOnly;
+
+      const obj = {
+        time: timeOut,
+        currency,
+        impact,
+        event,
+        previous,
+        forecast,
+        actual,
+      };
+      if (hasDate) obj.date = fmtDate(dateStr); // sertakan juga field date terpisah
+
+      out.push(obj);
+      lastEvent = obj;
+    }
+  }
+
+  return { items: out, kept: out.length };
+});
+
 
 
         console.log(`📄 Page offset=${(p - 1) * pageSize}: +${res.kept} (total ${all.length + res.kept})`);
