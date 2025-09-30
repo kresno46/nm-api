@@ -58,12 +58,12 @@ async function withPage(run) {
   try {
     return await run(page);
   } finally {
-    try { await page.close(); } catch {}
+    try { await page.close(); } catch { }
   }
 }
 
 async function closeBrowser() {
-  try { const b = await _browserPromise; await b?.close(); } catch {}
+  try { const b = await _browserPromise; await b?.close(); } catch { }
 }
 
 /** ===================== TOPIC MAP & PUSH (per-BAHASA) ===================== */
@@ -72,9 +72,9 @@ async function closeBrowser() {
 function topicBaseFor(category = '') {
   const c = (category || '').toLowerCase();
   if (c.includes('commodity')) return 'news_commodity';
-  if (c.includes('currenc'))  return 'news_currencies';
-  if (c.includes('index'))    return 'news_index';
-  if (c.includes('crypto'))   return 'news_crypto';
+  if (c.includes('currenc')) return 'news_currencies';
+  if (c.includes('index')) return 'news_index';
+  if (c.includes('crypto')) return 'news_crypto';
   if (c.includes('economy') || c.includes('fiscal')) return 'news_economy';
   if (c.includes('analysis')) return 'news_analysis';
   return 'news_all';
@@ -97,7 +97,7 @@ async function pushNews({ id, title, summary, image, category, language = 'id' }
   const lang = resolveLang(language);
   const baseTopic = topicBaseFor(category);
   const topicLangOnly = `news_${lang}`;
-  const topicCatLang  = `${baseTopic}_${lang}`;
+  const topicCatLang = `${baseTopic}_${lang}`;
 
   const deeplink = `newsmaker23://news?id=${id}`;
   const collapseKey = `news_${id}_${lang}`;
@@ -205,8 +205,8 @@ redis.on('error', (err) => console.error('❌ Redis error:', err));
 })();
 
 // ================================ helpers =================================
-const MONTHS_EN = { jan:0,january:0,feb:1,february:1,mar:2,march:2,apr:3,april:3,may:4,jun:5,june:5,jul:6,july:6,aug:7,august:7,sep:8,sept:8,september:8,oct:9,october:9,nov:10,november:10,dec:11,december:11 };
-const MONTHS_ID = { jan:0,januari:0,feb:1,februari:1,mar:2,maret:2,apr:3,april:3,mei:4,jun:5,juni:5,jul:6,juli:6,agu:7,agustus:7,agst:7,sep:8,september:8,okt:9,oktober:9,nov:10,november:10,des:11,desember:11 };
+const MONTHS_EN = { jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11 };
+const MONTHS_ID = { jan: 0, januari: 0, feb: 1, februari: 1, mar: 2, maret: 2, apr: 3, april: 3, mei: 4, jun: 5, juni: 5, jul: 6, juli: 6, agu: 7, agustus: 7, agst: 7, sep: 8, september: 8, okt: 9, oktober: 9, nov: 10, november: 10, des: 11, desember: 11 };
 
 function parsePublishedAt(dateStr = '', lang = 'en') {
   const s = String(dateStr).trim().replace(/\s+/g, ' ');
@@ -286,7 +286,7 @@ function makeNewsCacheKey({ lang, category, search, page, limit, fields }) {
   const qhash = crypto.createHash('md5').update(s).digest('hex');
   return `news:list:${lang}:cat:${c}:q:${qhash}:p:${page}:l:${limit}:f:${f}`;
 }
-const NEWS_ALLOWED_FIELDS = new Set(['id','title','link','image','category','date','summary','detail','language','createdAt','source_name','source_url','author','author_name','published_at']);
+const NEWS_ALLOWED_FIELDS = new Set(['id', 'title', 'link', 'image', 'category', 'date', 'summary', 'detail', 'language', 'createdAt', 'source_name', 'source_url', 'author', 'author_name', 'published_at']);
 function normalizeFields(fields) {
   if (!fields) return null;
   const arr = fields.split(',').map(s => s.trim()).filter(Boolean);
@@ -338,19 +338,19 @@ function deepCleanCalendar(obj) {
 
 
 // =========================== author utilities ============================
-const AUTHOR_ALLOW = new Set(['cp','ayu','az','azf','yds','arl','alg','mrv']);
+const AUTHOR_ALLOW = new Set(['cp', 'ayu', 'az', 'azf', 'yds', 'arl', 'alg', 'mrv']);
 const AUTHOR_BLACKLIST = new Set([
-  'wti','brent','fed','ecb','boj','pboc','fomc','cpi','pmi','gdp','usd','eur','jpy','ppi','nfp','iea','opec','ath','dxy',
-  'hkex','hsi','dax','stoxx','spx','ndx','vix','tsx','nifty','sensex','eia','api','bnb','ada','sol','xrp','dot','doge',
-  'tlt','ust','imf','wto','who','un','eu','uk','us','id','sg','my','th','vn','ph',
-  'ai','ml','nlp','fx','ipo','yoy','mom','qoq',
-  'bps','sep','boe','boc','rba','rbnz','bcb','ihk','ihp','ihsg','wib','wita','wit','ttm','ytd','q1','q2','q3','q4',
-  'bri','bni','btn','bsi','bca','cimb','ocbc','uob','dbs',
-  'rabu','kamis','jumat','sabtu','minggu','senin','selasa',
-  'news','newsmaker','source','sumber','editor','desk'
+  'wti', 'brent', 'fed', 'ecb', 'boj', 'pboc', 'fomc', 'cpi', 'pmi', 'gdp', 'usd', 'eur', 'jpy', 'ppi', 'nfp', 'iea', 'opec', 'ath', 'dxy',
+  'hkex', 'hsi', 'dax', 'stoxx', 'spx', 'ndx', 'vix', 'tsx', 'nifty', 'sensex', 'eia', 'api', 'bnb', 'ada', 'sol', 'xrp', 'dot', 'doge',
+  'tlt', 'ust', 'imf', 'wto', 'who', 'un', 'eu', 'uk', 'us', 'id', 'sg', 'my', 'th', 'vn', 'ph',
+  'ai', 'ml', 'nlp', 'fx', 'ipo', 'yoy', 'mom', 'qoq',
+  'bps', 'sep', 'boe', 'boc', 'rba', 'rbnz', 'bcb', 'ihk', 'ihp', 'ihsg', 'wib', 'wita', 'wit', 'ttm', 'ytd', 'q1', 'q2', 'q3', 'q4',
+  'bri', 'bni', 'btn', 'bsi', 'bca', 'cimb', 'ocbc', 'uob', 'dbs',
+  'rabu', 'kamis', 'jumat', 'sabtu', 'minggu', 'senin', 'selasa',
+  'news', 'newsmaker', 'source', 'sumber', 'editor', 'desk'
 ]);
-const AUTHOR_ALIASES = { 'cp':'cp','cP':'cp','CP':'cp','ayu':'ayu','ayiu':'ayu','ayi':'ayu','ay':'ayu','ads':'ayu','az':'az','azf':'azf','yds':'yds','arl':'arl','alg':'alg','mrv':'mrv' };
-const AUTHOR_NAME_MAP = { cp:'Broto', ayu:'Ayu', az:'Nova', azf:'Nova', yds:'Yudis', arl:'Arul', alg:'Burhan', mrv:'Marvy' };
+const AUTHOR_ALIASES = { 'cp': 'cp', 'cP': 'cp', 'CP': 'cp', 'ayu': 'ayu', 'ayiu': 'ayu', 'ayi': 'ayu', 'ay': 'ayu', 'ads': 'ayu', 'az': 'az', 'azf': 'azf', 'yds': 'yds', 'arl': 'arl', 'alg': 'alg', 'mrv': 'mrv' };
+const AUTHOR_NAME_MAP = { cp: 'Broto', ayu: 'Ayu', az: 'Nova', azf: 'Nova', yds: 'Yudis', arl: 'Arul', alg: 'Burhan', mrv: 'Marvy' };
 function normalizeAuthorInitial(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
@@ -507,7 +507,7 @@ async function withLock(key, ttlSeconds, fn) {
     try {
       const v = await redis.get(key);
       if (v === token) await redis.del(key);
-    } catch {}
+    } catch { }
   }
 }
 
@@ -625,9 +625,9 @@ async function scrapeNewsByLang(lang = 'en') {
     const rows = allNewItems.map(buildNewsRow);
 
     const UPDATE_COLS = [
-      'summary','detail','author','author_name','source_name','source_url',
-      'published_at','image','category','date','language','title',
-      'createdAt','updatedAt'
+      'summary', 'detail', 'author', 'author_name', 'source_name', 'source_url',
+      'published_at', 'image', 'category', 'date', 'language', 'title',
+      'createdAt', 'updatedAt'
     ];
     const MAX_DETAIL_CHARS = 500_000;
     const BATCH_SIZE = 150;
@@ -636,8 +636,8 @@ async function scrapeNewsByLang(lang = 'en') {
     const safeRows = trimmed.map(r => ({
       ...r,
       published_at: ensureDate(r.published_at),
-      createdAt:    ensureDate(r.createdAt),
-      updatedAt:    ensureDate(r.updatedAt),
+      createdAt: ensureDate(r.createdAt),
+      updatedAt: ensureDate(r.updatedAt),
     }));
 
     for (let i = 0; i < safeRows.length; i += BATCH_SIZE) {
@@ -653,7 +653,7 @@ async function scrapeNewsByLang(lang = 'en') {
 
             const rowDb = await News.findOne({
               where: { link: r.link },
-              attributes: ['id','title','summary','image','category','language'],
+              attributes: ['id', 'title', 'summary', 'image', 'category', 'language'],
               logging: false
             });
             if (rowDb?.id) {
@@ -681,8 +681,8 @@ async function scrapeNewsByLang(lang = 'en') {
             if (!(await alreadyPushed(redis, key))) {
               const rowDb = await News.findOne({
                 where: { link: r.link },
-                attributes: ['id','title','summary','image','category','language'],
-                logging:false
+                attributes: ['id', 'title', 'summary', 'image', 'category', 'language'],
+                logging: false
               });
               if (rowDb?.id) {
                 await pushNews({
@@ -713,9 +713,9 @@ async function scrapeNewsByLang(lang = 'en') {
 // ====== Calendar URL mapping (fixed) ======
 const CAL_URLS = {
   today: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar',
-  this:  'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=r&limitstart=0',
-  prev:  'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=p&limitstart=0',
-  next:  'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=n&limitstart=0',
+  this: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=r&limitstart=0',
+  prev: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=p&limitstart=0',
+  next: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=n&limitstart=0',
 };
 
 // ====== Redis key helper ======
@@ -724,9 +724,9 @@ const calKey = (t) => `calendar:${t}`;
 // ====== In-memory cache (opsional) ======
 let calendarCache = {
   today: { updatedAt: null, data: [] },
-  this:  { updatedAt: null, data: [] },
-  prev:  { updatedAt: null, data: [] },
-  next:  { updatedAt: null, data: [] },
+  this: { updatedAt: null, data: [] },
+  prev: { updatedAt: null, data: [] },
+  next: { updatedAt: null, data: [] },
 };
 
 const CAL_TTL_SECONDS = 60 * 15; // 15 menit
@@ -765,8 +765,8 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
       await page.evaluateOnNewDocument(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
       });
       await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
@@ -784,11 +784,11 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
         const url = (p === 1 ? startUrl : makePagedUrl(startUrl, offset));
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-        await page.waitForSelector('table tbody', { timeout: 60000 }).catch(() => {});
+        await page.waitForSelector('table tbody', { timeout: 60000 }).catch(() => { });
         await page.waitForFunction(
           () => document.querySelectorAll('table tbody tr').length >= 0,
           { timeout: 15000 }
-        ).catch(() => {});
+        ).catch(() => { });
 
         const res = await page.evaluate(() => {
           const norm = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
@@ -797,7 +797,7 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
             const tables = Array.from(document.querySelectorAll('table'));
             for (const tb of tables) {
               const ths = Array.from(tb.querySelectorAll('thead th')).map(th => norm(th.textContent).toLowerCase());
-              const ok = ths.includes('time') && ths.includes('country') && ths.includes('impact') && ths.some(t => t.includes('figure'));
+              const ok = ths.includes('time') && ths.some(t => t.includes('country')) && ths.includes('impact') && ths.some(t => t.includes('figure'));
               if (ok && tb.tBodies && tb.tBodies.length > 0) return tb;
             }
             return null;
@@ -811,21 +811,25 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
           const out = [];
           let lastEvent = null;
 
+          const isDateText = (txt) =>
+            /^\d{2}[-/]\d{2}[-/]\d{4}$/.test(txt) || /^\d{4}-\d{2}-\d{2}$/.test(txt);
+
           for (const tr of rows) {
             const tds = tr.cells;
 
+            // detail row (accordion)
             const isDetailRow = tds.length === 1 || Array.from(tds).some(td => (td.colSpan || 1) > 1);
             if (isDetailRow) {
               if (!lastEvent) continue;
               const wrap = tr.querySelector('.accordion-collapse') || tr;
-              const box  = wrap.querySelector('.box-cal-detail') || wrap;
+              const box = wrap.querySelector('.box-cal-detail') || wrap;
 
               const sections = Array.from(box.querySelectorAll('.mb-3'));
               const details = {};
               for (const sec of sections) {
                 const h = sec.querySelector('h5');
                 const title = norm(h?.textContent || '').toLowerCase();
-                const text  = norm(sec.textContent.replace(h?.textContent || '', ''));
+                const text = norm(sec.textContent.replace(h?.textContent || '', ''));
                 if (!title) continue;
                 if (title.includes('sources')) details.sources = text;
                 else if (title.includes('measures')) details.measures = text;
@@ -844,10 +848,10 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
                   const d0 = norm(cs[0]?.textContent || '');
                   if (/^(history|date)$/i.test(d0)) return null;
                   return {
-                    date:     d0,
+                    date: d0,
                     previous: norm(cs[1]?.textContent || ''),
                     forecast: norm(cs[2]?.textContent || ''),
-                    actual:   norm(cs[3]?.textContent || ''),
+                    actual: norm(cs[3]?.textContent || ''),
                   };
                 }).filter(x => x && x.date && /[0-9]/.test(x.date));
               }
@@ -857,9 +861,21 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
             }
 
             if (tds.length >= 4) {
-              const time = norm(tds[0]?.innerText || '-') || '-';
-              const currency = norm(tds[1]?.innerText || '-') || '-';
-              const impactCell = tds[2];
+              // --- bedain layout: with/without DATE column di posisi pertama ---
+              const c0 = norm(tds[0]?.innerText || '');
+              const c1 = norm(tds[1]?.innerText || '');
+              const hasDate = isDateText(c0);
+
+              const date = hasDate ? c0 : null;
+              const time = hasDate ? (c1 || '-') : (c0 || '-');
+
+              const idxCurrency = hasDate ? 2 : 1;
+              const idxImpact = hasDate ? 3 : 2;
+              const idxFigures = hasDate ? 4 : 3;
+
+              const currency = norm(tds[idxCurrency]?.innerText || '-') || '-';
+
+              const impactCell = tds[idxImpact];
               let impact =
                 norm(impactCell?.innerText || '') ||
                 impactCell?.getAttribute?.('title') ||
@@ -868,7 +884,7 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
                 '-';
               impact = norm(impact);
 
-              const figuresTd = tds[3];
+              const figuresTd = tds[idxFigures];
               const raw = norm(figuresTd?.innerText || '');
               if (!raw || raw === '-') continue;
 
@@ -880,13 +896,15 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
               if (figuresLine) {
                 const prevMatch = figuresLine.match(/Previous:\s*([^|]*)/i);
                 const foreMatch = figuresLine.match(/Forecast:\s*([^|]*)/i);
-                const actMatch  = figuresLine.match(/Actual:\s*([^|]*)/i);
+                const actMatch = figuresLine.match(/Actual:\s*([^|]*)/i);
                 previous = prevMatch ? norm(prevMatch[1]) : '-';
                 forecast = foreMatch ? norm(foreMatch[1]) : '-';
-                actual   = actMatch  ? norm(actMatch[1])  : '-';
+                actual = actMatch ? norm(actMatch[1]) : '-';
               }
 
               const obj = { time, currency, impact, event, previous, forecast, actual };
+              if (hasDate) obj.date = date; // ← hanya week pages yang punya date
+
               out.push(obj);
               lastEvent = obj;
             }
@@ -895,7 +913,8 @@ async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = 
           return { items: out, kept: out.length };
         });
 
-        console.log(`📄 Page offset=${(p-1)*pageSize}: +${res.kept} (total ${all.length + res.kept})`);
+
+        console.log(`📄 Page offset=${(p - 1) * pageSize}: +${res.kept} (total ${all.length + res.kept})`);
         if (res.kept === 0) break;
         all.push(...res.items);
         if (res.kept < pageSize) break;
@@ -932,7 +951,7 @@ async function scrapeCalendarThisWeek() {
   const cleaned = deepCleanCalendar(result.data);
   calendarCache.this = { updatedAt, data: cleaned };
   await redis.set(calKey('this'),
-    JSON.stringify({ status:'success', updatedAt, total: cleaned.length, data: cleaned }),
+    JSON.stringify({ status: 'success', updatedAt, total: cleaned.length, data: cleaned }),
     'EX', CAL_TTL_SECONDS
   );
   console.log(`✅ Calendar THIS WEEK updated (${cleaned.length} events)`);
@@ -946,7 +965,7 @@ async function scrapeCalendarPrevWeek() {
   const cleaned = deepCleanCalendar(result.data);
   calendarCache.prev = { updatedAt, data: cleaned };
   await redis.set(calKey('prev'),
-    JSON.stringify({ status:'success', updatedAt, total: cleaned.length, data: cleaned }),
+    JSON.stringify({ status: 'success', updatedAt, total: cleaned.length, data: cleaned }),
     'EX', CAL_TTL_SECONDS
   );
   console.log(`✅ Calendar PREVIOUS WEEK updated (${cleaned.length} events)`);
@@ -960,7 +979,7 @@ async function scrapeCalendarNextWeek() {
   const cleaned = deepCleanCalendar(result.data);
   calendarCache.next = { updatedAt, data: cleaned };
   await redis.set(calKey('next'),
-    JSON.stringify({ status:'success', updatedAt, total: cleaned.length, data: cleaned }),
+    JSON.stringify({ status: 'success', updatedAt, total: cleaned.length, data: cleaned }),
     'EX', CAL_TTL_SECONDS
   );
   console.log(`✅ Calendar NEXT WEEK updated (${cleaned.length} events)`);
@@ -986,10 +1005,10 @@ const CAL_LOCK_KEY = 'lock:cal:GLOBAL';
 function scheduleCal(fn) {
   enqueueCal(() => withLock(CAL_LOCK_KEY, 120, fn));
 }
-setInterval(() => scheduleCal(scrapeCalendarToday),      15 * 60 * 1000);
-setInterval(() => scheduleCal(scrapeCalendarThisWeek),   15 * 60 * 1000 + 10_000);
-setInterval(() => scheduleCal(scrapeCalendarPrevWeek),   15 * 60 * 1000 + 20_000);
-setInterval(() => scheduleCal(scrapeCalendarNextWeek),   15 * 60 * 1000 + 30_000);
+setInterval(() => scheduleCal(scrapeCalendarToday), 15 * 60 * 1000);
+setInterval(() => scheduleCal(scrapeCalendarThisWeek), 15 * 60 * 1000 + 10_000);
+setInterval(() => scheduleCal(scrapeCalendarPrevWeek), 15 * 60 * 1000 + 20_000);
+setInterval(() => scheduleCal(scrapeCalendarNextWeek), 15 * 60 * 1000 + 30_000);
 
 // ============================== schedulers (lain) ============================
 withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
@@ -1050,7 +1069,7 @@ async function scrapePageForSymbol(cid, start, retries = 3, backoff = 1000) {
       if (hasColspan) {
         const date = cols.first().text().trim();
         const event = cols.last().text().trim();
-        result.push({ date, event, open:null, high:null, low:null, close:null, change:null, volume:null, openInterest:null });
+        result.push({ date, event, open: null, high: null, low: null, close: null, change: null, volume: null, openInterest: null });
         return;
       }
       const textCols = cols.map((_, el) => $(el).text().trim()).get();
@@ -1169,7 +1188,7 @@ async function fillAuthorFromIDIfMissing(data) {
   if (altLink) {
     match = await News.findOne({
       where: { language: 'id', link: altLink },
-      attributes: ['author','author_name'],
+      attributes: ['author', 'author_name'],
       order: [['published_at', 'DESC']],
       logging: false,
     });
@@ -1177,7 +1196,7 @@ async function fillAuthorFromIDIfMissing(data) {
   if (!match && row.image) {
     match = await News.findOne({
       where: { language: 'id', image: row.image },
-      attributes: ['author','author_name'],
+      attributes: ['author', 'author_name'],
       order: [['published_at', 'DESC']],
       logging: false,
     });
@@ -1191,8 +1210,8 @@ async function fillAuthorFromIDIfMissing(data) {
     if (row.source_name) where.source_name = row.source_name;
     match = await News.findOne({
       where,
-      attributes: ['author','author_name'],
-      order: [['published_at','DESC']],
+      attributes: ['author', 'author_name'],
+      order: [['published_at', 'DESC']],
       logging: false,
     });
   }
@@ -1219,20 +1238,20 @@ app.get('/api/news', async (req, res) => {
     if (category !== 'all') where.category = { [Op.like]: `%${category}%` };
     if (search) {
       where[Op.or] = [
-        { title:   { [Op.like]: `%${search}%` } },
+        { title: { [Op.like]: `%${search}%` } },
         { summary: { [Op.like]: `%${search}%` } },
-        { detail:  { [Op.like]: `%${search}%` } },
+        { detail: { [Op.like]: `%${search}%` } },
       ];
     }
 
-    const cacheKey = makeNewsCacheKey({ lang:'en', category, search, page:p, limit:l, fields: attrs?.join(',') });
+    const cacheKey = makeNewsCacheKey({ lang: 'en', category, search, page: p, limit: l, fields: attrs?.join(',') });
     const cached = await redis.get(cacheKey);
     if (cached) return sendWithETag(req, res, JSON.parse(cached), 30);
 
     const { rows, count } = await News.findAndCountAll({
       where,
       attributes: attrs || undefined,
-      order: [['published_at','DESC'],['createdAt','DESC']],
+      order: [['published_at', 'DESC'], ['createdAt', 'DESC']],
       limit: l,
       offset: (p - 1) * l,
     });
@@ -1266,20 +1285,20 @@ app.get('/api/news-id', async (req, res) => {
     if (category !== 'all') where.category = { [Op.like]: `%${category}%` };
     if (search) {
       where[Op.or] = [
-        { title:   { [Op.like]: `%${search}%` } },
+        { title: { [Op.like]: `%${search}%` } },
         { summary: { [Op.like]: `%${search}%` } },
-        { detail:  { [Op.like]: `%${search}%` } },
+        { detail: { [Op.like]: `%${search}%` } },
       ];
     }
 
-    const cacheKey = makeNewsCacheKey({ lang:'id', category, search, page:p, limit:l, fields: attrs?.join(',') });
+    const cacheKey = makeNewsCacheKey({ lang: 'id', category, search, page: p, limit: l, fields: attrs?.join(',') });
     const cached = await redis.get(cacheKey);
     if (cached) return sendWithETag(req, res, JSON.parse(cached), 30);
 
     const { rows, count } = await News.findAndCountAll({
       where,
       attributes: attrs || undefined,
-      order: [['published_at','DESC'],['createdAt','DESC']],
+      order: [['published_at', 'DESC'], ['createdAt', 'DESC']],
       limit: l,
       offset: (p - 1) * l,
     });
@@ -1360,8 +1379,8 @@ app.get('/api/calendar/today', async (req, res) => {
       return res.json(payload);
     }
     const { updatedAt, data } = await enqueueCal(() => scrapeCalendarToday());
-    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
-    await redis.set(calKey('today'), JSON.stringify(payload), 'EX', 60*60);
+    const payload = { status: 'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('today'), JSON.stringify(payload), 'EX', 60 * 60);
     res.json(payload);
   } catch (err) {
     console.error('❌ /api/calendar/today error:', err.message);
@@ -1380,8 +1399,8 @@ app.get('/api/calendar/this-week', async (req, res) => {
       return res.json(payload);
     }
     const { updatedAt, data } = await enqueueCal(() => scrapeCalendarThisWeek());
-    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
-    await redis.set(calKey('this'), JSON.stringify(payload), 'EX', 60*60);
+    const payload = { status: 'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('this'), JSON.stringify(payload), 'EX', 60 * 60);
     res.json(payload);
   } catch (err) {
     console.error('❌ /api/calendar/this-week error:', err.message);
@@ -1400,8 +1419,8 @@ app.get('/api/calendar/previous-week', async (req, res) => {
       return res.json(payload);
     }
     const { updatedAt, data } = await enqueueCal(() => scrapeCalendarPrevWeek());
-    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
-    await redis.set(calKey('prev'), JSON.stringify(payload), 'EX', 60*60);
+    const payload = { status: 'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('prev'), JSON.stringify(payload), 'EX', 60 * 60);
     res.json(payload);
   } catch (err) {
     console.error('❌ /api/calendar/previous-week error:', err.message);
@@ -1420,8 +1439,8 @@ app.get('/api/calendar/next-week', async (req, res) => {
       return res.json(payload);
     }
     const { updatedAt, data } = await enqueueCal(() => scrapeCalendarNextWeek());
-    const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
-    await redis.set(calKey('next'), JSON.stringify(payload), 'EX', 60*60);
+    const payload = { status: 'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
+    await redis.set(calKey('next'), JSON.stringify(payload), 'EX', 60 * 60);
     res.json(payload);
   } catch (err) {
     console.error('❌ /api/calendar/next-week error:', err.message);
@@ -1434,9 +1453,9 @@ app.get('/api/calendar', async (req, res) => {
   try {
     const tParam = (req.query.t || 'today').toString().toLowerCase();
     if (tParam === 'today') return res.redirect(307, '/api/calendar/today');
-    if (tParam === 'this')  return res.redirect(307, '/api/calendar/this-week');
-    if (tParam === 'prev')  return res.redirect(307, '/api/calendar/previous-week');
-    if (tParam === 'next')  return res.redirect(307, '/api/calendar/next-week');
+    if (tParam === 'this') return res.redirect(307, '/api/calendar/this-week');
+    if (tParam === 'prev') return res.redirect(307, '/api/calendar/previous-week');
+    if (tParam === 'next') return res.redirect(307, '/api/calendar/next-week');
     return res.redirect(307, '/api/calendar/today');
   } catch (err) {
     console.error('❌ /api/calendar (legacy) error:', err.message);
@@ -1446,7 +1465,7 @@ app.get('/api/calendar', async (req, res) => {
 
 app.get('/api/calendar/all', async (req, res) => {
   try {
-    const keys = ['today','this','prev','next'];
+    const keys = ['today', 'this', 'prev', 'next'];
     const cached = await Promise.all(keys.map(k => redis.get(calKey(k))));
     const result = {};
     const toFetch = [];
@@ -1463,11 +1482,11 @@ app.get('/api/calendar/all', async (req, res) => {
       else if (k === 'prev') dataPack = await enqueueCal(() => scrapeCalendarPrevWeek());
       else if (k === 'next') dataPack = await enqueueCal(() => scrapeCalendarNextWeek());
 
-      result[k] = { status:'success', updatedAt: dataPack.updatedAt, total: dataPack.data.length, data: dataPack.data };
-      await redis.set(calKey(k), JSON.stringify(result[k]), 'EX', 60*60);
+      result[k] = { status: 'success', updatedAt: dataPack.updatedAt, total: dataPack.data.length, data: dataPack.data };
+      await redis.set(calKey(k), JSON.stringify(result[k]), 'EX', 60 * 60);
     }
 
-    res.json({ status:'success', ...result });
+    res.json({ status: 'success', ...result });
   } catch (err) {
     console.error('❌ /api/calendar/all error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
@@ -1669,11 +1688,12 @@ const server = app.listen(PORT, () => {
 function shutdown(sig) {
   console.log(`\n${sig} received. Shutting down...`);
   server.close(async () => {
-    try { await sequelize.close(); } catch {}
-    try { await redis.quit(); } catch {}
-    try { await closeBrowser(); } catch {}
+    try { await sequelize.close(); } catch { }
+    try { await redis.quit(); } catch { }
+    try { await closeBrowser(); } catch { }
     process.exit(0);
   });
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
