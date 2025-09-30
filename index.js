@@ -1576,7 +1576,7 @@ app.get('/api/historical', async (req, res) => {
 // ================================ Quotes ==================================
 app.get('/api/quotes', async (req, res) => {
   try {
-    const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIU5+LCOPX5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
+    const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIV5+LCOPZ5+SN1Z5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
     const { data } = await axios.get(url, { timeout: 15000 });
     const quotes = [];
     for (let i = 1; i <= data[0].count; i++) {
