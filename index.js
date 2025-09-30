@@ -31,6 +31,41 @@ if (!admin.apps.length) {
 }
 const fcm = admin.messaging();
 
+/** ========================== Puppeteer Singleton =========================== */
+let _browserPromise = null;
+
+async function getBrowser() {
+  if (_browserPromise) return _browserPromise;
+  _browserPromise = puppeteer.launch({
+    headless: true,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--no-zygote',
+      '--disable-gpu',
+      '--single-process',
+      '--disable-blink-features=AutomationControlled'
+    ]
+  });
+  return _browserPromise;
+}
+
+async function withPage(run) {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  try {
+    return await run(page);
+  } finally {
+    try { await page.close(); } catch {}
+  }
+}
+
+async function closeBrowser() {
+  try { const b = await _browserPromise; await b?.close(); } catch {}
+}
+
 /** ===================== TOPIC MAP & PUSH (per-BAHASA) ===================== */
 
 // peta kategori -> topic dasar (tanpa suffix bahasa)
@@ -61,8 +96,8 @@ async function alreadyPushed(redis, key) {
 async function pushNews({ id, title, summary, image, category, language = 'id' }) {
   const lang = resolveLang(language);
   const baseTopic = topicBaseFor(category);
-  const topicLangOnly = `news_${lang}`;                // <- app subscribe ke ini
-  const topicCatLang  = `${baseTopic}_${lang}`;        // <- opsional (kalau nanti mau filter per kategori)
+  const topicLangOnly = `news_${lang}`;
+  const topicCatLang  = `${baseTopic}_${lang}`;
 
   const deeplink = `newsmaker23://news?id=${id}`;
   const collapseKey = `news_${id}_${lang}`;
@@ -80,7 +115,7 @@ async function pushNews({ id, title, summary, image, category, language = 'id' }
       news_id: String(id),
       url: deeplink,
       category: String(category || ''),
-      language: lang, // ← penting: dipakai app buat buka detail dg bahasa benar
+      language: lang,
       click_action: 'FLUTTER_NOTIFICATION_CLICK',
     },
     android: {
@@ -95,17 +130,14 @@ async function pushNews({ id, title, summary, image, category, language = 'id' }
     apns: { payload: { aps: { sound: 'default' } }, fcmOptions: { imageUrl: image || undefined } },
   };
 
-  // 1) broadcast ke topic per-bahasa (WAJIB)
   const resLang = await fcm.send({ topic: topicLangOnly, ...commonMsg });
   console.log('📣 Push sent:', resLang, '→', topicLangOnly);
 
-  // 2) kompatibel/opsional ke topic kategori+bahasa
   if (process.env.FCM_TOPIC_CATEGORY_LANG === '1') {
     const resCatLang = await fcm.send({ topic: topicCatLang, ...commonMsg });
     console.log('📣 Push sent:', resCatLang, '→', topicCatLang);
   }
 
-  // 3) masa transisi ke topic lama tanpa bahasa (opsional)
   if (process.env.FCM_COMPAT_GLOBAL_TOPIC === '1') {
     const legacy = await fcm.send({ topic: baseTopic, ...commonMsg });
     console.log('📣 Push legacy:', legacy, '→', baseTopic);
@@ -265,17 +297,14 @@ function normalizeFields(fields) {
 // ---- text sanitizers ----
 function decodeUnicodeEscapes(s) {
   return String(s || '')
-    // unicode escapes commonly produced by some serializers
     .replace(/\u003E/g, '>')
     .replace(/\u003C/g, '<')
     .replace(/\u0026/g, '&')
     .replace(/\u00a0/g, ' ')
-    // html entities
     .replace(/&nbsp;/gi, ' ')
     .replace(/&gt;/gi, '>')
     .replace(/&lt;/gi, '<')
     .replace(/&amp;/gi, '&')
-    // collapse spaces
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -468,11 +497,18 @@ async function runParallelWithLimit(tasks, limit = 3) {
   return Promise.all(results);
 }
 
-async function withLock(lockKey, ttlSec, fn) {
-  const ok = await redis.set(lockKey, Date.now(), 'NX', 'EX', ttlSec);
-  if (!ok) { console.log(`🔒 Skip: lock ${lockKey} active`); return; }
+// ====== Distributed lock (single impl) ======
+async function withLock(key, ttlSeconds, fn) {
+  const token = `${Date.now()}-${Math.random()}`;
+  const ok = await redis.set(key, token, 'NX', 'EX', ttlSeconds);
+  if (!ok) { console.log(`🔒 Skip: lock ${key} active`); return; }
   try { await fn(); }
-  finally { try { await redis.del(lockKey); } catch { /* no-op */ } }
+  finally {
+    try {
+      const v = await redis.get(key);
+      if (v === token) await redis.del(key);
+    } catch {}
+  }
 }
 
 function buildNewsRow(n) {
@@ -617,7 +653,7 @@ async function scrapeNewsByLang(lang = 'en') {
 
             const rowDb = await News.findOne({
               where: { link: r.link },
-              attributes: ['id','title','summary','image','category','language'], // ← language ikut diambil
+              attributes: ['id','title','summary','image','category','language'],
               logging: false
             });
             if (rowDb?.id) {
@@ -627,7 +663,7 @@ async function scrapeNewsByLang(lang = 'en') {
                 summary: rowDb.summary || r.summary,
                 image: rowDb.image || r.image,
                 category: rowDb.category || r.category,
-                language: rowDb.language || r.language || lang, // ← penting
+                language: rowDb.language || r.language || lang,
               });
             }
           } catch (e) {
@@ -695,172 +731,179 @@ let calendarCache = {
 
 const CAL_TTL_SECONDS = 60 * 15; // 15 menit
 
+// === Global calendar QUEUE (serialize all) ===
+const calQueue = [];
+let calRunning = false;
+
+function enqueueCal(taskFn) {
+  return new Promise((resolve, reject) => {
+    calQueue.push({ taskFn, resolve, reject });
+    runCalQueue();
+  });
+}
+
+async function runCalQueue() {
+  if (calRunning) return;
+  calRunning = true;
+  while (calQueue.length) {
+    const { taskFn, resolve, reject } = calQueue.shift();
+    try { resolve(await taskFn()); }
+    catch (e) { reject(e); }
+  }
+  calRunning = false;
+}
+
 // ——— Core scraper dengan pagination ———
+// (refactor: reuse singleton browser via withPage, no launch here)
 async function scrapeCalendarPaged(startUrl, { maxPages = 20, pageSize = 20 } = {}) {
   console.log(`🗓️ Scraping (paged): ${startUrl}`);
-  let browser;
   const all = [];
 
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-blink-features=AutomationControlled',
-      ],
-    });
-    const page = await browser.newPage();
-
-    // stealth ringan
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.chrome = { runtime: {} };
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-    });
-    await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-    // helper bikin URL page ke-N sesuai pola situs (?start=offset)
-    const makePagedUrl = (u, offset) => {
-      const urlObj = new URL(u);
-      urlObj.searchParams.delete('limitstart'); // buang param lama kalau ada
-      if (offset > 0) urlObj.searchParams.set('start', String(offset));
-      else urlObj.searchParams.delete('start');
-      return urlObj.toString();
-    };
-
-    for (let p = 1, offset = 0; p <= maxPages; p++, offset += pageSize) {
-      const url = (p === 1 ? startUrl : makePagedUrl(startUrl, offset));
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-
-      // kalau tabel kosong, biarkan lanjut break di bawah
-      await page.waitForSelector('table tbody', { timeout: 60000 });
-      await page.waitForFunction(
-        () => document.querySelectorAll('table tbody tr').length >= 0,
-        { timeout: 15000 }
-      ).catch(() => {});
-
-      const res = await page.evaluate(() => {
-        const norm = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
-
-        function findMainTable() {
-          const tables = Array.from(document.querySelectorAll('table'));
-          for (const tb of tables) {
-            const ths = Array.from(tb.querySelectorAll('thead th')).map(th => norm(th.textContent).toLowerCase());
-            const ok = ths.includes('time') && ths.includes('country') && ths.includes('impact') && ths.some(t => t.includes('figure'));
-            if (ok && tb.tBodies && tb.tBodies.length > 0) return tb;
-          }
-          // fallback: null (biar dianggap 0 items)
-          return null;
-        }
-
-        const main = findMainTable();
-        if (!main) return { items: [], kept: 0 };
-
-        const tbody = main.tBodies[0];
-        const rows = Array.from(tbody.rows); // hanya TR langsung
-        const out = [];
-        let lastEvent = null;
-
-        for (const tr of rows) {
-          const tds = tr.cells;
-
-          // — detail row (accordion / colspan) —
-          const isDetailRow = tds.length === 1 || Array.from(tds).some(td => (td.colSpan || 1) > 1);
-          if (isDetailRow) {
-            if (!lastEvent) continue;
-            const wrap = tr.querySelector('.accordion-collapse') || tr;
-            const box  = wrap.querySelector('.box-cal-detail') || wrap;
-
-            const sections = Array.from(box.querySelectorAll('.mb-3'));
-            const details = {};
-            for (const sec of sections) {
-              const h = sec.querySelector('h5');
-              const title = norm(h?.textContent || '').toLowerCase();
-              const text  = norm(sec.textContent.replace(h?.textContent || '', ''));
-              if (!title) continue;
-              if (title.includes('sources')) details.sources = text;
-              else if (title.includes('measures')) details.measures = text;
-              else if (title.includes('usual effect')) details.usualEffect = text;
-              else if (title.includes('frequency')) details.frequency = text;
-              else if (title.includes('next released')) details.nextReleased = text;
-              else if (title.includes('notes')) details.notes = text;
-              else if (title.includes('why trader care')) details.whyTraderCare = text;
-            }
-
-            // table history (skip baris header)
-            const histTable = wrap.querySelector('table');
-            if (histTable) {
-              const histRows = Array.from(histTable.querySelectorAll('tbody tr'));
-              details.history = histRows.map(r => {
-                const cs = r.cells;
-                const d0 = norm(cs[0]?.textContent || '');
-                if (/^(history|date)$/i.test(d0)) return null;
-                return {
-                  date:     d0,
-                  previous: norm(cs[1]?.textContent || ''),
-                  forecast: norm(cs[2]?.textContent || ''),
-                  actual:   norm(cs[3]?.textContent || ''),
-                };
-              }).filter(x => x && x.date && /[0-9]/.test(x.date));
-            }
-
-            lastEvent.details = details;
-            continue;
-          }
-
-          // — main row —
-          if (tds.length >= 4) {
-            const time = norm(tds[0]?.innerText || '-') || '-';
-            const currency = norm(tds[1]?.innerText || '-') || '-';
-            const impactCell = tds[2];
-            let impact =
-              norm(impactCell?.innerText || '') ||
-              impactCell?.getAttribute?.('title') ||
-              impactCell?.querySelector?.('[title]')?.getAttribute('title') ||
-              impactCell?.querySelector?.('img')?.getAttribute('alt') ||
-              '-';
-            impact = norm(impact);
-
-            const figuresTd = tds[3];
-            const raw = norm(figuresTd?.innerText || '');
-            if (!raw || raw === '-') continue;
-
-            const [eventLine, figuresLine] = (figuresTd?.innerText || '').split('\n');
-            const event = norm(eventLine);
-            if (!event) continue;
-
-            let previous = '-', forecast = '-', actual = '-';
-            if (figuresLine) {
-              const prevMatch = figuresLine.match(/Previous:\s*([^|]*)/i);
-              const foreMatch = figuresLine.match(/Forecast:\s*([^|]*)/i);
-              const actMatch  = figuresLine.match(/Actual:\s*([^|]*)/i);
-              previous = prevMatch ? norm(prevMatch[1]) : '-';
-              forecast = foreMatch ? norm(foreMatch[1]) : '-';
-              actual   = actMatch  ? norm(actMatch[1])  : '-';
-            }
-
-            const obj = { time, currency, impact, event, previous, forecast, actual };
-            out.push(obj);
-            lastEvent = obj;
-          }
-        }
-
-        return { items: out, kept: out.length };
+    return await withPage(async (page) => {
+      // stealth ringan
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
       });
+      await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-      console.log(`📄 Page offset=${(p-1)*pageSize}: +${res.kept} (total ${all.length + res.kept})`);
-      if (res.kept === 0) break;          // halaman kosong → selesai
-      all.push(...res.items);
-      if (res.kept < pageSize) break;     // halaman terakhir (< 20 item) → selesai
-    }
+      // helper bikin URL page ke-N
+      const makePagedUrl = (u, offset) => {
+        const urlObj = new URL(u);
+        urlObj.searchParams.delete('limitstart');
+        if (offset > 0) urlObj.searchParams.set('start', String(offset));
+        else urlObj.searchParams.delete('start');
+        return urlObj.toString();
+      };
 
-    await browser.close();
-    return { ok: true, data: all, error: null };
+      for (let p = 1, offset = 0; p <= maxPages; p++, offset += pageSize) {
+        const url = (p === 1 ? startUrl : makePagedUrl(startUrl, offset));
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+
+        await page.waitForSelector('table tbody', { timeout: 60000 }).catch(() => {});
+        await page.waitForFunction(
+          () => document.querySelectorAll('table tbody tr').length >= 0,
+          { timeout: 15000 }
+        ).catch(() => {});
+
+        const res = await page.evaluate(() => {
+          const norm = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
+
+          function findMainTable() {
+            const tables = Array.from(document.querySelectorAll('table'));
+            for (const tb of tables) {
+              const ths = Array.from(tb.querySelectorAll('thead th')).map(th => norm(th.textContent).toLowerCase());
+              const ok = ths.includes('time') && ths.includes('country') && ths.includes('impact') && ths.some(t => t.includes('figure'));
+              if (ok && tb.tBodies && tb.tBodies.length > 0) return tb;
+            }
+            return null;
+          }
+
+          const main = findMainTable();
+          if (!main) return { items: [], kept: 0 };
+
+          const tbody = main.tBodies[0];
+          const rows = Array.from(tbody.rows);
+          const out = [];
+          let lastEvent = null;
+
+          for (const tr of rows) {
+            const tds = tr.cells;
+
+            const isDetailRow = tds.length === 1 || Array.from(tds).some(td => (td.colSpan || 1) > 1);
+            if (isDetailRow) {
+              if (!lastEvent) continue;
+              const wrap = tr.querySelector('.accordion-collapse') || tr;
+              const box  = wrap.querySelector('.box-cal-detail') || wrap;
+
+              const sections = Array.from(box.querySelectorAll('.mb-3'));
+              const details = {};
+              for (const sec of sections) {
+                const h = sec.querySelector('h5');
+                const title = norm(h?.textContent || '').toLowerCase();
+                const text  = norm(sec.textContent.replace(h?.textContent || '', ''));
+                if (!title) continue;
+                if (title.includes('sources')) details.sources = text;
+                else if (title.includes('measures')) details.measures = text;
+                else if (title.includes('usual effect')) details.usualEffect = text;
+                else if (title.includes('frequency')) details.frequency = text;
+                else if (title.includes('next released')) details.nextReleased = text;
+                else if (title.includes('notes')) details.notes = text;
+                else if (title.includes('why trader care')) details.whyTraderCare = text;
+              }
+
+              const histTable = wrap.querySelector('table');
+              if (histTable) {
+                const histRows = Array.from(histTable.querySelectorAll('tbody tr'));
+                details.history = histRows.map(r => {
+                  const cs = r.cells;
+                  const d0 = norm(cs[0]?.textContent || '');
+                  if (/^(history|date)$/i.test(d0)) return null;
+                  return {
+                    date:     d0,
+                    previous: norm(cs[1]?.textContent || ''),
+                    forecast: norm(cs[2]?.textContent || ''),
+                    actual:   norm(cs[3]?.textContent || ''),
+                  };
+                }).filter(x => x && x.date && /[0-9]/.test(x.date));
+              }
+
+              lastEvent.details = details;
+              continue;
+            }
+
+            if (tds.length >= 4) {
+              const time = norm(tds[0]?.innerText || '-') || '-';
+              const currency = norm(tds[1]?.innerText || '-') || '-';
+              const impactCell = tds[2];
+              let impact =
+                norm(impactCell?.innerText || '') ||
+                impactCell?.getAttribute?.('title') ||
+                impactCell?.querySelector?.('[title]')?.getAttribute('title') ||
+                impactCell?.querySelector?.('img')?.getAttribute('alt') ||
+                '-';
+              impact = norm(impact);
+
+              const figuresTd = tds[3];
+              const raw = norm(figuresTd?.innerText || '');
+              if (!raw || raw === '-') continue;
+
+              const [eventLine, figuresLine] = (figuresTd?.innerText || '').split('\n');
+              const event = norm(eventLine);
+              if (!event) continue;
+
+              let previous = '-', forecast = '-', actual = '-';
+              if (figuresLine) {
+                const prevMatch = figuresLine.match(/Previous:\s*([^|]*)/i);
+                const foreMatch = figuresLine.match(/Forecast:\s*([^|]*)/i);
+                const actMatch  = figuresLine.match(/Actual:\s*([^|]*)/i);
+                previous = prevMatch ? norm(prevMatch[1]) : '-';
+                forecast = foreMatch ? norm(foreMatch[1]) : '-';
+                actual   = actMatch  ? norm(actMatch[1])  : '-';
+              }
+
+              const obj = { time, currency, impact, event, previous, forecast, actual };
+              out.push(obj);
+              lastEvent = obj;
+            }
+          }
+
+          return { items: out, kept: out.length };
+        });
+
+        console.log(`📄 Page offset=${(p-1)*pageSize}: +${res.kept} (total ${all.length + res.kept})`);
+        if (res.kept === 0) break;
+        all.push(...res.items);
+        if (res.kept < pageSize) break;
+      }
+
+      return { ok: true, data: all, error: null };
+    });
   } catch (err) {
-    if (browser) try { await browser.close(); } catch {}
     console.error('❌ scrapeCalendarPaged failed:', err.message);
     return { ok: false, data: [], error: err.message };
   }
@@ -924,10 +967,40 @@ async function scrapeCalendarNextWeek() {
   return calendarCache.next;
 }
 
+// ====== Pre-warm calendar (serial via queue) ======
+(async () => {
+  try {
+    await enqueueCal(() => scrapeCalendarToday());
+    await enqueueCal(() => scrapeCalendarThisWeek());
+    await enqueueCal(() => scrapeCalendarPrevWeek());
+    await enqueueCal(() => scrapeCalendarNextWeek());
+    console.log('✅ Pre-warm calendar done');
+  } catch (e) {
+    console.error('❌ Pre-warm error:', e.message);
+  }
+})();
 
+// ====== SCHEDULERS (Calendar serialized + single global lock) ======
+const CAL_LOCK_KEY = 'lock:cal:GLOBAL';
 
+function scheduleCal(fn) {
+  enqueueCal(() => withLock(CAL_LOCK_KEY, 120, fn));
+}
+setInterval(() => scheduleCal(scrapeCalendarToday),      15 * 60 * 1000);
+setInterval(() => scheduleCal(scrapeCalendarThisWeek),   15 * 60 * 1000 + 10_000);
+setInterval(() => scheduleCal(scrapeCalendarPrevWeek),   15 * 60 * 1000 + 20_000);
+setInterval(() => scheduleCal(scrapeCalendarNextWeek),   15 * 60 * 1000 + 30_000);
 
-// =========================== historical scraper ===========================
+// ============================== schedulers (lain) ============================
+withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
+withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
+withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
+
+setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData()), 4 * 60 * 60 * 1000);
+setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 5 * 60 * 1000);
+setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 5 * 60 * 1000);
+
+// ================================ historical ================================
 const BASE_URL = 'https://newsmaker.id/index.php/en/historical-data-2';
 const MAX_CONCURRENT_SCRAPES = 10;
 let cachedSymbols = null;
@@ -1131,59 +1204,6 @@ async function fillAuthorFromIDIfMissing(data) {
   return row;
 }
 
-// Jalankan sekali saat boot (one-off)
-(async () => {
-  try {
-    await scrapeCalendarToday();
-    await scrapeCalendarThisWeek();
-    await scrapeCalendarPrevWeek();
-    await scrapeCalendarNextWeek();
-    console.log('✅ Pre-warm calendar done');
-  } catch (e) {
-    console.error('❌ Pre-warm error:', e.message);
-  }
-})();
-
-// ====== OPTIONAL: helper lock biar nggak dobel ======
-async function withLock(key, ttlSeconds, fn) {
-  const token = `${Date.now()}-${Math.random()}`;
-  const ok = await redis.set(key, token, 'NX', 'EX', ttlSeconds);
-  if (!ok) return; // sudah ada yang jalan
-  try { await fn(); } finally {
-    const v = await redis.get(key);
-    if (v === token) await redis.del(key);
-  }
-}
-
-// ====== SCHEDULERS ======
-if (!global.__CAL_SCHEDULER__) {
-  global.__CAL_SCHEDULER__ = true;
-
-  // boot: stagger 10s antar job supaya Puppeteer nggak tabrakan
-  withLock('lock:cal:today', 120, scrapeCalendarToday);
-  setTimeout(() => withLock('lock:cal:this', 120, scrapeCalendarThisWeek), 10_000);
-  setTimeout(() => withLock('lock:cal:prev', 120, scrapeCalendarPrevWeek), 20_000);
-  setTimeout(() => withLock('lock:cal:next', 120, scrapeCalendarNextWeek), 30_000);
-
-  // interval: setiap 15 menit, di-stagger juga
-  setInterval(() => withLock('lock:cal:today', 120, scrapeCalendarToday), 15 * 60 * 1000);
-  setInterval(() => withLock('lock:cal:this', 120, scrapeCalendarThisWeek), 15 * 60 * 1000 + 10_000);
-  setInterval(() => withLock('lock:cal:prev', 120, scrapeCalendarPrevWeek), 15 * 60 * 1000 + 20_000);
-  setInterval(() => withLock('lock:cal:next', 120, scrapeCalendarNextWeek), 15 * 60 * 1000 + 30_000);
-}
-
-
-// ============================== schedulers ================================
-withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en'));
-withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id'));
-// scrapeCalendar();
-withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData());
-
-setInterval(() => withLock('lock:hist:all', 3600, () => scrapeAllHistoricalData()), 4 * 60 * 60 * 1000);
-setInterval(() => withLock('lock:scrapeNews:en', 300, () => scrapeNewsByLang('en')), 5 * 60 * 1000);
-setInterval(() => withLock('lock:scrapeNews:id', 300, () => scrapeNewsByLang('id')), 5 * 60 * 1000);
-// setInterval(scrapeCalendar, 15 * 60 * 1000);
-
 // ================================== API ==================================
 // NEWS EN
 app.get('/api/news', async (req, res) => {
@@ -1328,8 +1348,7 @@ app.get('/api/news-id/:id', async (req, res) => {
   }
 });
 
-// Calendar API
-// ===== TODAY =====
+// ================================ Calendar API =============================
 // TODAY
 app.get('/api/calendar/today', async (req, res) => {
   try {
@@ -1340,7 +1359,7 @@ app.get('/api/calendar/today', async (req, res) => {
       payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
       return res.json(payload);
     }
-    const { updatedAt, data } = await scrapeCalendarToday();
+    const { updatedAt, data } = await enqueueCal(() => scrapeCalendarToday());
     const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
     await redis.set(calKey('today'), JSON.stringify(payload), 'EX', 60*60);
     res.json(payload);
@@ -1350,8 +1369,7 @@ app.get('/api/calendar/today', async (req, res) => {
   }
 });
 
-
-// ===== THIS WEEK =====
+// THIS WEEK
 app.get('/api/calendar/this-week', async (req, res) => {
   try {
     const cached = await redis.get(calKey('this'));
@@ -1361,7 +1379,7 @@ app.get('/api/calendar/this-week', async (req, res) => {
       payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
       return res.json(payload);
     }
-    const { updatedAt, data } = await scrapeCalendarThisWeek();
+    const { updatedAt, data } = await enqueueCal(() => scrapeCalendarThisWeek());
     const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
     await redis.set(calKey('this'), JSON.stringify(payload), 'EX', 60*60);
     res.json(payload);
@@ -1371,7 +1389,7 @@ app.get('/api/calendar/this-week', async (req, res) => {
   }
 });
 
-// ===== PREVIOUS WEEK =====
+// PREVIOUS WEEK
 app.get('/api/calendar/previous-week', async (req, res) => {
   try {
     const cached = await redis.get(calKey('prev'));
@@ -1381,7 +1399,7 @@ app.get('/api/calendar/previous-week', async (req, res) => {
       payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
       return res.json(payload);
     }
-    const { updatedAt, data } = await scrapeCalendarPrevWeek();
+    const { updatedAt, data } = await enqueueCal(() => scrapeCalendarPrevWeek());
     const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
     await redis.set(calKey('prev'), JSON.stringify(payload), 'EX', 60*60);
     res.json(payload);
@@ -1391,7 +1409,7 @@ app.get('/api/calendar/previous-week', async (req, res) => {
   }
 });
 
-// ===== NEXT WEEK =====
+// NEXT WEEK
 app.get('/api/calendar/next-week', async (req, res) => {
   try {
     const cached = await redis.get(calKey('next'));
@@ -1401,7 +1419,7 @@ app.get('/api/calendar/next-week', async (req, res) => {
       payload.total = Array.isArray(payload.data) ? payload.data.length : 0;
       return res.json(payload);
     }
-    const { updatedAt, data } = await scrapeCalendarNextWeek();
+    const { updatedAt, data } = await enqueueCal(() => scrapeCalendarNextWeek());
     const payload = { status:'success', updatedAt, total: data.length, data: deepCleanCalendar(data) };
     await redis.set(calKey('next'), JSON.stringify(payload), 'EX', 60*60);
     res.json(payload);
@@ -1411,7 +1429,7 @@ app.get('/api/calendar/next-week', async (req, res) => {
   }
 });
 
-// ===== (Optional) Legacy param ?t=... agar kompatibel =====
+// Legacy param ?t=...
 app.get('/api/calendar', async (req, res) => {
   try {
     const tParam = (req.query.t || 'today').toString().toLowerCase();
@@ -1438,13 +1456,12 @@ app.get('/api/calendar/all', async (req, res) => {
       else toFetch.push(k);
     });
 
-    // scrape yang belum ada
     for (const k of toFetch) {
       let dataPack;
-      if (k === 'today') dataPack = await scrapeCalendarToday();
-      else if (k === 'this') dataPack = await scrapeCalendarThisWeek();
-      else if (k === 'prev') dataPack = await scrapeCalendarPrevWeek();
-      else if (k === 'next') dataPack = await scrapeCalendarNextWeek();
+      if (k === 'today') dataPack = await enqueueCal(() => scrapeCalendarToday());
+      else if (k === 'this') dataPack = await enqueueCal(() => scrapeCalendarThisWeek());
+      else if (k === 'prev') dataPack = await enqueueCal(() => scrapeCalendarPrevWeek());
+      else if (k === 'next') dataPack = await enqueueCal(() => scrapeCalendarNextWeek());
 
       result[k] = { status:'success', updatedAt: dataPack.updatedAt, total: dataPack.data.length, data: dataPack.data };
       await redis.set(calKey(k), JSON.stringify(result[k]), 'EX', 60*60);
@@ -1457,54 +1474,7 @@ app.get('/api/calendar/all', async (req, res) => {
   }
 });
 
-
-
-// Historical API
-app.get('/api/historical', async (req, res) => {
-  try {
-    const { QueryTypes } = require('sequelize');
-    const tableName = HistoricalData.getTableName().toString();
-
-    const orderedSymbols = await sequelize.query(`
-      SELECT symbol, latestDate, updatedAtMax
-      FROM (
-        SELECT
-          symbol,
-          MAX(STR_TO_DATE(\`date\`, '%d %b %Y')) AS latestDate,
-          MAX(updatedAt) AS updatedAtMax
-        FROM \`${tableName}\`
-        GROUP BY symbol
-      ) AS t
-      ORDER BY (latestDate IS NULL), latestDate DESC, updatedAtMax DESC
-    `, { type: QueryTypes.SELECT });
-
-    if (!orderedSymbols.length) {
-      return res.status(404).json({ status: 'empty', message: 'No historical data found.' });
-    }
-
-    const allData = [];
-    for (const row of orderedSymbols) {
-      const symbol = row.symbol;
-      const rows = await HistoricalData.findAll({
-        where: { symbol },
-        order: [
-          [sequelize.literal("(STR_TO_DATE(`date`, '%d %b %Y') IS NULL)"), 'ASC'],
-          [sequelize.literal("STR_TO_DATE(`date`, '%d %b %Y')"), 'DESC'],
-          ['updatedAt', 'DESC'],
-        ],
-        raw: true,
-      });
-      allData.push({ symbol, data: rows, updatedAt: row.updatedAtMax || null });
-    }
-
-    return res.json({ status: 'success', totalSymbols: allData.length, data: allData });
-  } catch (err) {
-    console.error('❌ /api/historical error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Quotes
+// ================================ Quotes ==================================
 app.get('/api/quotes', async (req, res) => {
   try {
     const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIU5+LCOPX5+SN1U5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
@@ -1539,7 +1509,7 @@ app.get('/api/quotes', async (req, res) => {
   }
 });
 
-// Shorts (YouTube RSS) – dipertahankan
+// ================================ Shorts (YouTube RSS) ====================
 const ytCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 function ytBuildFeedUrl({ channelId, user, playlistId }) {
   if (channelId) return `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
@@ -1701,6 +1671,7 @@ function shutdown(sig) {
   server.close(async () => {
     try { await sequelize.close(); } catch {}
     try { await redis.quit(); } catch {}
+    try { await closeBrowser(); } catch {}
     process.exit(0);
   });
 }
