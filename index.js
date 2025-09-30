@@ -1529,6 +1529,50 @@ app.get('/api/calendar/all', async (req, res) => {
   }
 });
 
+app.get('/api/historical', async (req, res) => {
+  try {
+    const { QueryTypes } = require('sequelize');
+    const tableName = HistoricalData.getTableName().toString();
+
+    const orderedSymbols = await sequelize.query(`
+      SELECT symbol, latestDate, updatedAtMax
+      FROM (
+        SELECT
+          symbol,
+          MAX(STR_TO_DATE(\`date\`, '%d %b %Y')) AS latestDate,
+          MAX(updatedAt) AS updatedAtMax
+        FROM \`${tableName}\`
+        GROUP BY symbol
+      ) AS t
+      ORDER BY (latestDate IS NULL), latestDate DESC, updatedAtMax DESC
+    `, { type: QueryTypes.SELECT });
+
+    if (!orderedSymbols.length) {
+      return res.status(404).json({ status: 'empty', message: 'No historical data found.' });
+    }
+
+    const allData = [];
+    for (const row of orderedSymbols) {
+      const symbol = row.symbol;
+      const rows = await HistoricalData.findAll({
+        where: { symbol },
+        order: [
+          [sequelize.literal("(STR_TO_DATE(`date`, '%d %b %Y') IS NULL)"), 'ASC'],
+          [sequelize.literal("STR_TO_DATE(`date`, '%d %b %Y')"), 'DESC'],
+          ['updatedAt', 'DESC'],
+        ],
+        raw: true,
+      });
+      allData.push({ symbol, data: rows, updatedAt: row.updatedAtMax || null });
+    }
+
+    return res.json({ status: 'success', totalSymbols: allData.length, data: allData });
+  } catch (err) {
+    console.error('❌ /api/historical error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ================================ Quotes ==================================
 app.get('/api/quotes', async (req, res) => {
   try {
@@ -1732,4 +1776,5 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
 
