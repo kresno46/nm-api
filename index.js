@@ -1574,10 +1574,36 @@ app.get('/api/historical', async (req, res) => {
 });
 
 // ================================ Quotes ==================================
+// ===== Nonce untuk live quotes (increment +1 tiap 15 detik) =====
+let liveQuotesSeq = Math.floor(Date.now() / 15000); // seed awal biar unik
+let liveQuotesLastTick = Date.now();
+
+/**
+ * Menghasilkan angka yang bertambah +1 setiap 15 detik.
+ * Jika tidak ada request selama beberapa interval, kita lompat sesuai jumlah interval yang lewat.
+ */
+function nextLiveQuotesNonce() {
+  const now = Date.now();
+  const ticks = Math.floor((now - liveQuotesLastTick) / 15000);
+  if (ticks >= 1) {
+    liveQuotesSeq += ticks;
+    liveQuotesLastTick += ticks * 15000;
+  }
+  return liveQuotesSeq;
+}
+
 app.get('/api/quotes', async (req, res) => {
   try {
-    const url = 'https://www.newsmaker.id/quotes/live?s=LGD+LSI+GHSIV5+LCOPZ5+SN1Z5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
+    // daftar simbol default mengikuti halaman live-quotes terbaru
+    const defaultSymbols = 'LGD+LSI+GHSIV5+LCOPZ5+SN1Z5+DJIA+DAX+DX+AUDUSD+EURUSD+GBPUSD+CHF+JPY+RP';
+    const symbolsParam = (req.query.s || defaultSymbols).toString().trim();
+
+    // nonce yang naik +1 tiap 15 detik
+    const nonce = nextLiveQuotesNonce();
+
+    const url = `https://www.newsmaker.id/quotes/live?s=${symbolsParam}&_=${nonce}`;
     const { data } = await axios.get(url, { timeout: 15000 });
+
     const quotes = [];
     for (let i = 1; i <= data[0].count; i++) {
       const high = data[i].high !== 0 ? data[i].high : data[i].last;
@@ -1592,7 +1618,20 @@ app.get('/api/quotes', async (req, res) => {
         percentChange: data[i].percentChange,
       });
     }
-    return res.json({ status: 'success', updatedAt: new Date(), total: quotes.length, data: quotes, source: 'live' });
+
+    // simpan sedikit cache fallback bila perlu
+    cachedQuotes = quotes;
+    lastUpdatedQuotes = new Date();
+
+    return res.json({
+      status: 'success',
+      updatedAt: lastUpdatedQuotes,
+      total: quotes.length,
+      data: quotes,
+      source: 'live',
+      nonce,                       // opsional: kirim balik untuk debug
+      symbols: symbolsParam,       // opsional: kirim balik untuk debug
+    });
   } catch (err) {
     console.error('❌ /api/quotes error:', err.message);
     if (Array.isArray(cachedQuotes) && cachedQuotes.length > 0) {
@@ -1602,11 +1641,18 @@ app.get('/api/quotes', async (req, res) => {
         low: q.low !== 0 ? q.low : q.last,
         open: q.open !== 0 ? q.open : q.last,
       }));
-      return res.json({ status: 'degraded', updatedAt: lastUpdatedQuotes, total: validQuotes.length, data: validQuotes, source: 'fallback-cache' });
+      return res.json({
+        status: 'degraded',
+        updatedAt: lastUpdatedQuotes,
+        total: validQuotes.length,
+        data: validQuotes,
+        source: 'fallback-cache',
+      });
     }
     return res.status(502).json({ status: 'error', message: 'Failed to fetch live quotes', detail: err.message });
   }
 });
+
 
 // ================================ Shorts (YouTube RSS) ====================
 const ytCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
@@ -1776,5 +1822,6 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
 
 
