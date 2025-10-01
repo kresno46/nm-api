@@ -1035,6 +1035,8 @@ async function scrapeCalendarNextWeek() {
   }
 })();
 
+
+
 // ====== SCHEDULERS (Calendar serialized + single global lock) ======
 const CAL_LOCK_KEY = 'lock:cal:GLOBAL';
 
@@ -1822,6 +1824,7 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
 
 
 
