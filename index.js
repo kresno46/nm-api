@@ -17,6 +17,7 @@ const { XMLParser } = require('fast-xml-parser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const Sequelize = require('sequelize');
 const { Op, literal } = Sequelize;
 
 // ============================ Firebase Admin (FCM) ============================
@@ -1903,6 +1904,7 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
 
 
 
