@@ -712,7 +712,7 @@ async function scrapeNewsByLang(lang = 'en') {
 // ============================== calendar job ==============================
 // ====== Calendar URL mapping (fixed) ======
 const CAL_URLS = {
-  today: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar',
+  today: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?limitstart=0',
   this: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=r&limitstart=0',
   prev: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=p&limitstart=0',
   next: 'https://www.newsmaker.id/index.php/en/analysis/economic-calendar/marketcalendar?t=n&limitstart=0',
@@ -966,8 +966,7 @@ const res = await page.evaluate(() => {
 
 // ——— Wrapper per-tab (today/this/prev/next) + cleaning & Redis ———
 async function scrapeCalendarToday() {
-  const result = await scrapeCalendarPaged(CAL_URLS.today, { maxPages: 1 });
-  if (!result.ok) throw new Error(result.error || 'Scrape today failed');
+  const result = await scrapeCalendarPaged(CAL_URLS.today, { maxPages: 20, pageSize: 20 });  if (!result.ok) throw new Error(result.error || 'Scrape today failed');
   const updatedAt = new Date();
   const cleaned = deepCleanCalendar(result.data);
   calendarCache.today = { updatedAt, data: cleaned };
@@ -1824,6 +1823,7 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
 
 
 
