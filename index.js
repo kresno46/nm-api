@@ -17,8 +17,6 @@ const { XMLParser } = require('fast-xml-parser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const Sequelize = require('sequelize');
-const { Op, literal } = Sequelize;
 
 // ============================ Firebase Admin (FCM) ============================
 const admin = require('firebase-admin');
@@ -1577,83 +1575,27 @@ app.get('/api/historical', async (req, res) => {
   }
 });
 
-// ============================ Historical Query API =========================
-function sqlDateExpr() {
-  return literal(`
-    COALESCE(
-      STR_TO_DATE(\`date\`, '%d-%m-%Y'),
-      STR_TO_DATE(\`date\`, '%Y-%m-%d')
-    )
-  `);
-}
-
-/**
- * GET /api/historical/query
- * Params:
- *   - symbol (wajib): persis seperti di DB (contoh: "LGD Daily", "Brent Oil", "AUD/USD")
- *   - start, end (opsional): YYYY-MM-DD
- *   - order (opsional): asc|desc, default asc
- *   - page, limit (opsional): default 1, 200 (maks 2000)
- */
 app.get('/api/historical/query', async (req, res) => {
-  try {
-    const symbol = String(req.query.symbol || '').trim();
-    if (!symbol) return res.status(400).json({ status: 'error', message: 'Parameter "symbol" wajib.' });
+  const { start_date, end_date } = req.query;
 
-    const startStr = req.query.start ? String(req.query.start).trim() : null;
-    const endStr   = req.query.end   ? String(req.query.end).trim()   : null;
+  let whereClause = {};
 
-    const orderDir = (String(req.query.order || 'asc').toLowerCase() === 'desc') ? 'DESC' : 'ASC';
-    const page  = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 2000);
-    const offset = (page - 1) * limit;
-
-    // Cache key per kombinasi query
-    const cacheKey = `hist:q:${symbol}:${startStr || 'min'}:${endStr || 'max'}:${orderDir}:l${limit}:p${page}`;
-    const cached = await redis.get(cacheKey).catch(() => null);
-    if (cached) return sendWithETag(req, res, JSON.parse(cached), 60);
-
-    // WHERE dasar
-    const where = { symbol };
-
-    // Filter rentang tanggal, pakai ekspresi STR_TO_DATE agar BETWEEN jalan di kolom string
-    if (startStr || endStr) {
-      const s = startStr ? new Date(startStr) : new Date('1970-01-01');
-      const e = endStr   ? new Date(endStr)   : new Date('2100-12-31');
-      where[Op.and] = [Sequelize.where(sqlDateExpr(), { [Op.between]: [s, e] })];
-    }
-
-    // Hitung total
-    const total = await HistoricalData.count({ where, logging: false });
-
-    // Ambil data dengan ORDER BY tanggal asli
-    const rows = await HistoricalData.findAll({
-      where,
-      order: [[sqlDateExpr(), orderDir]],
-      limit,
-      offset,
-      attributes: ['id','symbol','date','event','open','high','low','close','change','volume','openInterest','createdAt'],
-      logging: false,
-    });
-
-    const payload = {
-      status: 'success',
-      symbol,
-      page,
-      perPage: limit,
-      total,
-      order: orderDir.toLowerCase(),
-      data: rows
-    };
-
-    await redis.set(cacheKey, JSON.stringify(payload), 'EX', 60).catch(() => {});
-    return sendWithETag(req, res, payload, 60);
-  } catch (err) {
-    console.error('❌ /api/historical/query error:', err.message);
-    res.status(500).json({ status: 'error', message: 'Internal server error', detail: err.message });
+  if (start_date && end_date) {
+    whereClause.date = { [Op.between]: [start_date, end_date] };
+  } else if (start_date) {
+    whereClause.date = { [Op.gte]: start_date };
+  } else if (end_date) {
+    whereClause.date = { [Op.lte]: end_date };
   }
-});
 
+  const data = await Historical.findAll({ where: whereClause });
+
+  res.json({
+    status: 'success',
+    total: data.length,
+    data
+  });
+});
 
 // ================================ Quotes ==================================
 // ===== Nonce untuk live quotes (increment +1 tiap 15 detik) =====
@@ -1904,8 +1846,6 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-
-
 
 
 
